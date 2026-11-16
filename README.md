@@ -15,6 +15,10 @@ Clearspace stores a structured, local JSONL action history at `~/.local/share/cl
 ## Safety
 
 - Scanning is read-only and stays on the filesystem containing the scanned path.
+- The GTK-free tree scanner loads one directory level on demand, includes hidden files,
+  counts allocated disk blocks, counts hardlinked files once, and never follows symlinks.
+- Scanner errors remain attached to their nodes; large directories collapse the remaining
+  entries into a non-selectable informational row.
 - Cleanup runs one native command at a time, with a confirmation dialog showing the command and expected impact.
 - Data-bearing targets such as Trash, Docker volumes, browser profiles, model downloads, and project directories are inspection-only.
 - The app does not invoke a shell or request administrator privileges.

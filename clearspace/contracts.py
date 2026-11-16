@@ -28,6 +28,7 @@ class Node:
     children_loaded: bool = False
     children: list[Node] = field(default_factory=list)
     size_is_partial: bool = False
+    selectable: bool = True
 
     def __post_init__(self) -> None:
         if self.size_bytes < 0:
@@ -45,6 +46,8 @@ class SelectionModel:
 
     def set_checked(self, node: Node, checked: bool) -> None:
         """Set a node's selection, clearing descendants when checking it."""
+        if not node.selectable:
+            return
         if checked:
             self._checked = {
                 path for path in self._checked
