@@ -42,11 +42,19 @@ from clearspace.scanner import TreeScanner
 class TreeEntry(GObject.Object):
     """GTK list item wrapper around a GTK-free filesystem Node."""
 
-    def __init__(self, node: Node, evaluation: RuleEvaluation | None = None, *, loading=False):
+    def __init__(
+        self,
+        node: Node,
+        evaluation: RuleEvaluation | None = None,
+        *,
+        loading=False,
+        parent_entry=None,
+    ):
         super().__init__()
         self.node = node
         self.evaluation = evaluation
         self.loading = loading
+        self.parent_entry = parent_entry
         self.children_store = Gio.ListStore.new(TreeEntry)
         self.children_model = None
         self.loading_children = False
@@ -94,21 +102,21 @@ class Clearspace(Gtk.Application):
         outer.set_margin_end(20)
         self.stack.add_named(outer, "results")
 
-        heading = Gtk.Label(label="Clearspace · Uso do disco")
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=16)
+        outer.append(header)
+        heading = Gtk.Label(label="Disk cleanup", xalign=0, hexpand=True)
         heading.add_css_class("title-1")
-        heading.set_xalign(0)
-        outer.append(heading)
+        header.append(heading)
         intro = Gtk.Label(
-            label="Explore a árvore local, entenda os riscos e revise cada item antes de agir."
+            label="Explore the local tree, understand risks, and review each item before acting."
         )
         intro.set_xalign(0)
         intro.add_css_class("dim-label")
         outer.append(intro)
 
-        self.disk_label = Gtk.Label(label="Preparando leitura…")
-        self.disk_label.set_xalign(0)
-        self.disk_label.add_css_class("heading")
-        outer.append(self.disk_label)
+        self.disk_label = Gtk.Label(label="", xalign=1, wrap=True)
+        self.disk_label.add_css_class("scan-muted")
+        header.append(self.disk_label)
         self.partial_banner = Gtk.Box(spacing=10)
         self.partial_banner.add_css_class("scan-chip")
         partial_label = Gtk.Label(label="These are partial results.", xalign=0, hexpand=True)
@@ -143,15 +151,23 @@ class Clearspace(Gtk.Application):
         panes.set_end_child(self.details)
         panes.set_position(900)
 
-        footer = Gtk.Box(spacing=12)
-        footer.add_css_class("toolbar")
-        self.selection_label = Gtk.Label(label="Nada selecionado", xalign=0, hexpand=True)
-        footer.append(self.selection_label)
-        self.review_button = Gtk.Button(label="Revisar seleção")
+        footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        footer.add_css_class("results-footer")
+        footer_row = Gtk.Box(spacing=12)
+        self.selection_label = Gtk.Label(label="0 items selected", xalign=0, hexpand=True)
+        footer_row.append(self.selection_label)
+        self.review_button = Gtk.Button(label="Review and clean…")
         self.review_button.add_css_class("suggested-action")
         self.review_button.set_sensitive(False)
         self.review_button.connect("clicked", self.review_selection)
-        footer.append(self.review_button)
+        footer_row.append(self.review_button)
+        footer.append(footer_row)
+        trash_note = Gtk.Label(
+            label="Items go to the Trash first. Space is freed when you empty it.",
+            xalign=0,
+        )
+        trash_note.add_css_class("selection-note")
+        footer.append(trash_note)
         outer.append(footer)
 
         self.scan()
@@ -172,6 +188,14 @@ class Clearspace(Gtk.Application):
         button { min-height: 40px; }
         .scan-current-path { font-family: monospace; color: #a9b0b3; }
         .scan-chip { background: #1c1f20; border-radius: 8px; padding: 8px 10px; }
+        .badge { border-radius: 999px; padding: 4px 9px; font-weight: 600; }
+        .risk-low { background: #1f3a2a; color: #8fe0b0; }
+        .risk-moderate { background: #3d3418; color: #f2d27a; }
+        .risk-user-data { background: #1c3350; color: #9cc8ff; }
+        .risk-critical { background: #49252b; color: #ffc1c5; }
+        .selection-note { color: #a9b0b3; font-size: 0.9em; }
+        .results-footer { background: #1c1f20; border: 1px solid #34383a;
+            border-radius: 12px; padding: 10px 14px; }
         """
         provider = Gtk.CssProvider()
         provider.load_from_data(css.encode("utf-8"))
@@ -516,6 +540,7 @@ class Clearspace(Gtk.Application):
         name_column = self._name_column()
         name_column.set_expand(True)
         self.tree_view.append_column(name_column)
+        self.tree_view.append_column(self._usage_column())
         self.tree_view.append_column(self._size_column())
         self.tree_view.append_column(self._risk_column())
         parent = self.tree_placeholder.get_parent()
@@ -527,10 +552,11 @@ class Clearspace(Gtk.Application):
         report["gtk_model_build_seconds"] = round(time.monotonic() - ui_build_started, 3)
         report["python_peak_rss_kib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
         if usage:
+            elapsed_ms = int(float(report.get("elapsed_seconds", 0)) * 1000)
             self.disk_label.set_text(
-                f"Raiz: {self.scan_root} · {format_bytes(usage.free)} livres de "
-                f"{format_bytes(usage.total)} · varredura em "
-                f"{report.get('elapsed_seconds', 0):.2f} s"
+                f"{format_size_gib(usage.free)} free of {format_size_gib(usage.total)} · "
+                f"scanned {report.get('directories', 0):,} folders in "
+                f"{format_elapsed(elapsed_ms)}"
             )
         self.scan_button.set_sensitive(True)
         self._workflow_busy = False
@@ -570,7 +596,13 @@ class Clearspace(Gtk.Application):
         )
         self._show_message("Relatório da varredura", detail)
 
-    def _new_entry(self, node: Node, evaluation: RuleEvaluation | None) -> TreeEntry:
+    def _new_entry(
+        self,
+        node: Node,
+        evaluation: RuleEvaluation | None,
+        *,
+        parent_entry: TreeEntry | None = None,
+    ) -> TreeEntry:
         if any(
             node.path == protected
             or node.path.is_relative_to(protected)
@@ -578,7 +610,7 @@ class Clearspace(Gtk.Application):
             for protected in self.inspection_only_roots
         ):
             node.selectable = False
-        entry = TreeEntry(node, evaluation)
+        entry = TreeEntry(node, evaluation, parent_entry=parent_entry)
         entry.scanner = self.scanner
         if node.selectable:
             self.entries.setdefault(node.path, entry)
@@ -592,6 +624,10 @@ class Clearspace(Gtk.Application):
         if left.node.size_bytes > right.node.size_bytes:
             return Gtk.Ordering.SMALLER
         if left.node.size_bytes < right.node.size_bytes:
+            return Gtk.Ordering.LARGER
+        if left.node.name.casefold() < right.node.name.casefold():
+            return Gtk.Ordering.SMALLER
+        if left.node.name.casefold() > right.node.name.casefold():
             return Gtk.Ordering.LARGER
         return Gtk.Ordering.EQUAL
 
@@ -633,7 +669,9 @@ class Clearspace(Gtk.Application):
             entry.children_store.append(TreeEntry(error_node))
         else:
             for node, evaluation in evaluated:
-                entry.children_store.append(self._new_entry(node, evaluation))
+                entry.children_store.append(
+                    self._new_entry(node, evaluation, parent_entry=entry)
+                )
         if entry.node.path == self.scan_root and not error:
             self.scan_report["time_to_home_children_seconds"] = round(
                 time.monotonic() - self._scan_started_at, 3
@@ -745,34 +783,47 @@ class Clearspace(Gtk.Application):
             else:
                 label.remove_css_class("error")
 
+    def _usage_column(self):
+        factory = Gtk.SignalListItemFactory.new()
+        factory.connect("setup", self._usage_setup)
+        factory.connect("bind", self._usage_bind)
+        column = Gtk.ColumnViewColumn.new("Relative usage", factory)
+        column.set_fixed_width(145)
+        return column
+
+    def _usage_setup(self, _factory, list_item):
+        progress = Gtk.ProgressBar(hexpand=True)
+        progress.set_size_request(95, 8)
+        list_item.set_child(progress)
+
+    def _usage_bind(self, _factory, list_item):
+        entry = list_item.get_item().get_item()
+        progress = list_item.get_child()
+        if entry.parent_entry:
+            siblings = entry.parent_entry.node.children
+        else:
+            siblings = (self.root_node,) if self.root_node else ()
+        max_size = max((node.size_bytes for node in siblings), default=1)
+        max_size = max(1, max_size)
+        fraction = min(1.0, entry.node.size_bytes / max_size)
+        progress.set_fraction(fraction)
+
     def _size_column(self):
         factory = Gtk.SignalListItemFactory.new()
         factory.connect("setup", self._size_setup)
         factory.connect("bind", self._size_bind)
-        column = Gtk.ColumnViewColumn.new("Uso em disco", factory)
-        column.set_fixed_width(230)
+        column = Gtk.ColumnViewColumn.new("Size", factory)
+        column.set_fixed_width(110)
         return column
 
     def _size_setup(self, _factory, list_item):
-        box = Gtk.Box(spacing=8)
-        progress = Gtk.ProgressBar(hexpand=True)
-        progress.set_size_request(90, -1)
         detail = Gtk.Label(xalign=1)
-        detail.set_width_chars(19)
-        box.append(progress)
-        box.append(detail)
-        list_item.set_child(box)
+        detail.set_width_chars(12)
+        list_item.set_child(detail)
 
     def _size_bind(self, _factory, list_item):
         entry = list_item.get_item().get_item()
-        box = list_item.get_child()
-        progress = box.get_first_child()
-        detail = progress.get_next_sibling()
-        max_size = max(1, self.root_node.size_bytes if self.root_node else 1)
-        fraction = min(1.0, entry.node.size_bytes / max_size)
-        progress.set_fraction(fraction)
-        progress.set_text(f"{fraction * 100:.1f}%")
-        progress.set_show_text(True)
+        detail = list_item.get_child()
         text = self._size_in_mib_or_gib(entry.node.size_bytes)
         if entry.node.size_is_partial:
             text += " · parcial"
@@ -801,18 +852,23 @@ class Clearspace(Gtk.Application):
     def _risk_bind(self, _factory, list_item):
         entry = list_item.get_item().get_item()
         label = list_item.get_child()
-        for css in ("success", "warning", "error"):
+        for css in ("risk-low", "risk-moderate", "risk-user-data", "risk-critical"):
             label.remove_css_class(css)
         if entry.node.aggregate_count:
             label.set_text("—")
             return
         risk = entry.evaluation.risk if entry.evaluation else Risk.MODERATE
-        label.set_text(risk.value.replace("_", " "))
+        label.set_text({
+            Risk.LOW: "Low",
+            Risk.MODERATE: "Moderate",
+            Risk.USER_DATA: "Your data",
+            Risk.CRITICAL: "Critical",
+        }[risk])
         css_class = {
-            Risk.LOW: "success",
-            Risk.MODERATE: "warning",
-            Risk.USER_DATA: "warning",
-            Risk.CRITICAL: "error",
+            Risk.LOW: "risk-low",
+            Risk.MODERATE: "risk-moderate",
+            Risk.USER_DATA: "risk-user-data",
+            Risk.CRITICAL: "risk-critical",
         }[risk]
         label.add_css_class(css_class)
 
@@ -907,9 +963,15 @@ class Clearspace(Gtk.Application):
             key=self._risk_rank,
             default=None,
         )
-        risk_text = max_risk.value.replace("_", " ") if max_risk else "sem risco"
+        risk_text = {
+            Risk.LOW: "Low",
+            Risk.MODERATE: "Moderate",
+            Risk.USER_DATA: "Your data",
+            Risk.CRITICAL: "Critical",
+        }.get(max_risk, "None")
         self.selection_label.set_text(
-            f"{len(paths)} itens · {format_bytes(total)} estimados · risco máximo: {risk_text}"
+            f"{len(paths)} items selected · {format_size_gib(total)} · "
+            f"highest risk: {risk_text}"
         )
         self.review_button.set_sensitive(bool(paths) and not self._workflow_busy)
 
