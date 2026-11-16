@@ -1,0 +1,253 @@
+"""Local inventory, cleanup actions, and structured history for Clearspace."""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shutil
+import stat
+import subprocess
+import time
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Callable
+
+
+logger = logging.getLogger(__name__)
+
+
+
+
+def format_bytes(value: int) -> str:
+    amount = float(value)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if amount < 1024 or unit == "TiB":
+            return f"{amount:.1f} {unit}" if unit != "B" else f"{int(amount)} B"
+        amount /= 1024
+    return f"{amount:.1f} TiB"
+
+
+@dataclass(frozen=True)
+class DirectorySize:
+    bytes: int
+    errors: tuple[str, ...] = ()
+    missing: bool = False
+
+    @property
+    def partial(self) -> bool:
+        return bool(self.errors) and not self.missing
+
+
+def directory_size(path: Path) -> DirectorySize:
+    """Measure a directory without following symlinks or crossing filesystems."""
+    total = 0
+    errors: list[str] = []
+
+    def record_error(error: OSError) -> None:
+        message = f"{error.filename or path}: {error.strerror or error}"
+        errors.append(message)
+        logger.warning("Could not read during scan: %s", message)
+
+    try:
+        root_device = path.stat().st_dev
+    except FileNotFoundError as error:
+        record_error(error)
+        return DirectorySize(0, tuple(errors), missing=True)
+    except OSError as error:
+        record_error(error)
+        return DirectorySize(0, tuple(errors))
+
+    try:
+        for current, dirs, files in os.walk(path, followlinks=False, onerror=record_error):
+            current_path = Path(current)
+            try:
+                if current_path.stat().st_dev != root_device:
+                    dirs[:] = []
+                    continue
+            except OSError as error:
+                record_error(error)
+                dirs[:] = []
+                continue
+            kept_dirs = []
+            for name in dirs:
+                candidate = current_path / name
+                try:
+                    info = candidate.lstat()
+                except OSError as error:
+                    record_error(error)
+                    continue
+                if stat.S_ISLNK(info.st_mode):
+                    total += info.st_size
+                elif info.st_dev == root_device:
+                    kept_dirs.append(name)
+            dirs[:] = kept_dirs
+            for name in files:
+                candidate = current_path / name
+                try:
+                    info = candidate.lstat()
+                    if stat.S_ISLNK(info.st_mode):
+                        total += info.st_size
+                    elif info.st_dev != root_device:
+                        continue
+                    else:
+                        total += info.st_size
+                except OSError as error:
+                    record_error(error)
+    except OSError as error:
+        record_error(error)
+    return DirectorySize(total, tuple(errors))
+
+
+@dataclass(frozen=True)
+class Candidate:
+    id: str
+    title: str
+    description: str
+    path: str | None
+    size: int | None
+    command: tuple[str, ...] | None
+    risk: str
+    available: bool = True
+    read_error: str | None = None
+    partial: bool = False
+
+
+def discover_candidates() -> list[Candidate]:
+    home = Path.home()
+    candidates: list[Candidate] = []
+
+    def add_path(key: str, title: str, path: Path, description: str, risk: str) -> None:
+        result = directory_size(path)
+        errors = list(result.errors)
+        if result.missing:
+            candidates.append(Candidate(key, title, description, str(path), None, None, risk,
+                                         False, "; ".join(errors) or "diretório inexistente"))
+            return
+        if path.is_symlink():
+            message = f"{path}: caminho é um symlink; alvo não seguido"
+            logger.warning("Could not read during scan: %s", message)
+            candidates.append(Candidate(key, title, description, str(path), 0, None, risk,
+                                         False, message))
+            return
+        candidates.append(Candidate(key, title, description, str(path), result.bytes, None, risk,
+                                     True, "; ".join(errors) or None, result.partial))
+
+    add_path("go-build", "Go build cache", home / ".cache/go-build",
+             "Compiled build artifacts. Go rebuilds them as needed.", "Low risk")
+    add_path("vscode-cpp", "VS Code C/C++ index cache", home / ".cache/vscode-cpptools",
+             "Extension indexing data. Close VS Code first; indexes will be rebuilt.", "Moderate risk")
+    add_path("trash", "Trash", home / ".local/share/Trash",
+             "Files here may still be wanted. Review them in your file manager.", "Personal data · inspect only")
+    add_path("huggingface", "Hugging Face files", home / ".cache/huggingface",
+             "May contain large models and datasets that are expensive to download again.", "Personal data · inspect only")
+    add_path("prism", "PrismLauncher data", home / ".local/share/PrismLauncher",
+             "May contain Minecraft worlds, instances, and modpacks.", "Personal data · inspect only")
+    add_path("postman", "Postman data", home / ".config/Postman",
+             "May contain local settings, workspaces, and application data.", "Personal data · inspect only")
+    add_path("gradle", "Gradle data", home / ".gradle",
+             "May contain build caches, wrapper distributions, and project state.", "Personal data · inspect only")
+    add_path("codex", "Codex data", home / ".codex",
+             "May contain local configuration and user data.", "Personal data · inspect only")
+    add_path("yay", "yay package cache", home / ".cache/yay",
+             "May contain package build files and cached sources.", "Personal data · inspect only")
+
+    if shutil.which("go"):
+        candidates.append(Candidate("go-clean", "Go build cache (Go tool)", None,
+            "Use Go's own cache cleanup command.", None, ("go", "clean", "-cache"), "Low risk"))
+    if shutil.which("pnpm"):
+        candidates.append(Candidate("pnpm-prune", "Unused pnpm store packages", None,
+            "Prune packages pnpm considers unreferenced by known projects.", None,
+            ("pnpm", "store", "prune"), "Moderate risk"))
+    if shutil.which("docker"):
+        try:
+            result = subprocess.run(["docker", "system", "df"], capture_output=True,
+                                    text=True, timeout=10, check=False)
+            if result.returncode == 0:
+                inventory = result.stdout.strip() or "Docker returned no inventory details."
+                candidates.append(Candidate("docker-inventory", "Docker disk usage", inventory,
+                    None, None, None, "Personal data · inspect only"))
+            else:
+                error = (result.stderr.strip() or result.stdout.strip()
+                         or f"docker system df exited with status {result.returncode}")
+                logger.warning("Docker inventory failed: %s", error)
+                candidates.append(Candidate("docker-inventory", "Docker disk usage",
+                    "Não foi possível ler: " + error, None, None, None,
+                    "Personal data · inspect only", read_error=error))
+        except (OSError, subprocess.SubprocessError) as error:
+            message = str(error)
+            logger.warning("Docker inventory failed: %s", message)
+            candidates.append(Candidate("docker-inventory", "Docker disk usage",
+                "Não foi possível ler: " + message, None, None, None,
+                "Personal data · inspect only", read_error=message))
+        candidates.append(Candidate("docker-build", "Docker build cache", None,
+            "Remove unused build cache. Future image builds may take longer.", None,
+            ("docker", "builder", "prune", "-a", "-f"), "Moderate risk"))
+    if shutil.which("npm"):
+        npm_cache = subprocess.run(["npm", "config", "get", "cache"], capture_output=True, text=True, timeout=5)
+        cache_path = Path(npm_cache.stdout.strip()).expanduser() if npm_cache.returncode == 0 else home / ".npm"
+        add_path("npm-cache", "npm cache", cache_path,
+                 "Cached packages can be downloaded again. npm cache verify is a non-destructive alternative.", "Low risk")
+    if shutil.which("journalctl"):
+        result = subprocess.run(["journalctl", "--disk-usage"], capture_output=True, text=True, timeout=5)
+        amount = None
+        if result.returncode == 0:
+            import re
+            match = re.search(r"([\d.]+)\s*(B|K|M|G|T)B?", result.stdout, re.I)
+            if match:
+                amount = int(float(match.group(1)) * (1024 ** ("BKMGT".index(match.group(2).upper()))))
+        candidates.append(Candidate("journal", "System journal", None,
+            "Reduce archived logs to approximately 200 MiB. Requires administrator access, so this app does not execute it.",
+            amount, None, "System action · inspect only", shutil.which("journalctl") is not None))
+    return candidates
+
+
+class History:
+    def __init__(self, path: Path | None = None):
+        self.path = path or Path.home() / ".local/share/clearspace/history.jsonl"
+
+    def append(self, record: dict) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self.path.open("a", encoding="utf-8") as stream:
+            stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
+
+    def recent(self, limit: int = 8) -> list[dict]:
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return []
+        records = []
+        for line in reversed(lines):
+            try:
+                records.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+            if len(records) >= limit:
+                break
+        return records
+
+
+def execute_cleanup(candidate: Candidate, history: History,
+                    on_finish: Callable[[dict], None]) -> None:
+    """Run a reviewed native cleanup command without shell interpolation."""
+    if candidate.command is None:
+        raise ValueError("This candidate has no executable cleanup action")
+    started = time.time()
+    before_result = directory_size(Path(candidate.path)) if candidate.path else None
+    before = before_result.bytes if before_result else candidate.size
+    try:
+        result = subprocess.run(candidate.command, capture_output=True, text=True, timeout=1800)
+        status, stdout, stderr = result.returncode, result.stdout[-4000:], result.stderr[-4000:]
+    except subprocess.TimeoutExpired as exc:
+        status, stdout, stderr = 124, "", str(exc)
+    after_result = directory_size(Path(candidate.path)) if candidate.path else None
+    after = after_result.bytes if after_result else None
+    record = {
+        "schema_version": 1, "action_id": candidate.id, "title": candidate.title,
+        "timestamp_start": started, "timestamp_end": time.time(),
+        "command": list(candidate.command), "exit_code": status,
+        "before_bytes": before, "after_bytes": after,
+        "stdout": stdout, "stderr": stderr,
+    }
+    history.append(record)
+    on_finish(record)
