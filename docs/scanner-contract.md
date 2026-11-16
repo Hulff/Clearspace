@@ -107,6 +107,37 @@ Python caller must reject a missing terminal event, malformed JSON, an
 unsupported protocol version, or a mismatch between exit status and terminal
 event.
 
+### GTK-independent progress view (protocol version 2)
+
+The v1 inventory events above remain supported by the Rust binary. The Python
+application adapts those events (or Python scanner callbacks) to a
+scanner-independent `ProgressEvent`. A future scanner process that emits live
+folder progress uses JSONL protocol version 2, one object per line:
+
+```jsonl
+{"protocol_version":2,"event":"progress","dirs_done":43,"dirs_total_est":428,"files":2048,"bytes":73400320,"elapsed_ms":1200,"current_path":"/scan/root/example","state":"running","partial":false}
+{"protocol_version":2,"event":"progress","dirs_done":43,"dirs_total_est":441,"files":2100,"bytes":75497472,"elapsed_ms":1300,"current_path":"/scan/root/another","state":"running","partial":false}
+{"protocol_version":2,"event":"completed","dirs_done":441,"dirs_total_est":441,"files":2177,"bytes":75497472,"elapsed_ms":1500,"state":"done","partial":false}
+```
+
+`dirs_total_est` is nullable and may increase as directories are discovered.
+When it is null, clients show indeterminate progress. `dirs_done`, `files`,
+`bytes`, and `elapsed_ms` are nonnegative cumulative values; `bytes` means
+allocated bytes (`st_blocks * 512`). `current_path` is local display data only;
+it is untrusted and cannot authorize an action. `state` is one of `running`,
+`paused`, `cancelled`, `done`, or `error`. Cancellation is cooperative and a
+terminal `cancelled` event sets `partial` to true; the partial inventory remains
+available.
+
+The current v1 binary does not emit these live fields and does not support
+process pause/resume. Until upgraded, the Python integration adapts whatever
+progress is available and must not claim folder-level live progress from the
+Rust backend. For the future subprocess adapter, pause/resume applies
+`SIGSTOP`/`SIGCONT` only to the directly spawned scanner child process (never
+through a shell); the controller owns that process handle and does not signal
+arbitrary process IDs. A thread-based scanner instead cooperates through its
+pause event.
+
 ## Process and safety requirements
 
 The Python caller invokes `clearspace-scan` with an argument vector and
