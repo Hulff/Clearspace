@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import heapq
 import os
 import stat
 import time
@@ -23,7 +24,7 @@ class TreeScanner:
     """
 
     root_path: Path
-    max_visible_children: int = 200
+    max_visible_children: int = 100
     _root_device: int | None = field(default=None, init=False, repr=False)
     _seen_inodes: set[tuple[int, int]] = field(default_factory=set, init=False, repr=False)
     _root_node: Node | None = field(default=None, init=False, repr=False)
@@ -69,13 +70,48 @@ class TreeScanner:
         if not node.is_dir or node.children_loaded:
             return
         self.expand(node)
-        for child in node.children:
+        pending = node.children
+        node.children = []
+        largest: list[tuple[int, int, Node]] = []
+        hidden_size = 0
+        hidden_count = 0
+        total_size = 0
+        for index, child in enumerate(pending):
+            if child is None:
+                continue
             if child.is_dir:
                 self._expand_recursively(child)
+            total_size += child.size_bytes
+            if len(largest) < self.max_visible_children:
+                heapq.heappush(largest, (child.size_bytes, index, child))
+            elif self.max_visible_children and child.size_bytes > largest[0][0]:
+                _size, _index, removed = heapq.heapreplace(
+                    largest, (child.size_bytes, index, child)
+                )
+                hidden_size += removed.size_bytes
+                hidden_count += 1
+            else:
+                hidden_size += child.size_bytes
+                hidden_count += 1
+            pending[index] = None
         if node.children_loaded:
-            node.size_bytes = self._directory_metadata_bytes.get(node.path, 0) + sum(
-                child.size_bytes for child in node.children
-            )
+            node.children = [
+                entry for _size, _index, entry in sorted(
+                    largest, key=lambda item: item[0], reverse=True
+                )
+            ]
+            if hidden_count:
+                node.children.append(Node(
+                    path=node.path / ".clearspace-aggregate-row",
+                    name=f"{hidden_count} itens menores",
+                    is_dir=False,
+                    size_bytes=hidden_size,
+                    children_loaded=True,
+                    selectable=False,
+                    aggregate_count=hidden_count,
+                ))
+            node.size_bytes = self._directory_metadata_bytes.get(node.path, 0) + total_size
+        del pending
 
     def expand(self, node: Node) -> list[Node]:
         """Load one directory level, sorting largest entries first."""
@@ -126,14 +162,9 @@ class TreeScanner:
             children.append(child)
 
         children.sort(key=lambda item: item.size_bytes, reverse=True)
-        # Keep every real entry visible. Large directories are already scanned
-        # in the background, so hiding rows would obscure the full inventory.
-
         node.children = children
         node.children_loaded = True
         node.size_bytes = sum(child.size_bytes for child in children)
-        if self._root_node is not None:
-            self._recalculate_loaded_sizes(self._root_node)
         return children
 
     def _open_directory_fd(self, path: Path) -> int:
@@ -150,13 +181,6 @@ class TreeScanner:
         except Exception:
             os.close(directory_fd)
             raise
-
-    def _recalculate_loaded_sizes(self, node: Node) -> int:
-        if node.is_dir and node.children_loaded:
-            node.size_bytes = self._directory_metadata_bytes.get(node.path, 0) + sum(
-                self._recalculate_loaded_sizes(child) for child in node.children
-            )
-        return node.size_bytes
 
     def _node_for(self, path: Path, *, is_root: bool = False) -> Node:
         try:

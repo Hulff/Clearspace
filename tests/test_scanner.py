@@ -19,6 +19,7 @@ def test_scans_complete_tree_and_includes_hidden_entries(tmp_path: Path) -> None
     root = scanner.scan_root()
 
     assert root.children_loaded
+    assert not hasattr(root, "__dict__")
     hidden = next(node for node in root.children if node.name == ".hidden")
     assert hidden.children_loaded
     assert [node.name for node in hidden.children] == ["payload"]
@@ -84,8 +85,10 @@ def test_hardlinks_count_once_and_large_directories_aggregate(tmp_path: Path) ->
     files = [node for node in root.children if node.name.startswith("file-")]
     selection = SelectionModel([root])
     selection.set_checked(files[0], True)
+    aggregate = next(node for node in root.children if "itens menores" in node.name)
 
     assert selection.selected_paths == (files[0].path,)
-    assert len(root.children) == 5
+    assert len(root.children) == 3  # top two entries plus one aggregate row
+    assert not aggregate.selectable
     assert root.size_bytes > 0
     assert scanner.report["files"] == 5

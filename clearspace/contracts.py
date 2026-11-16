@@ -16,7 +16,7 @@ class SelectionState(StrEnum):
     PARTIAL = "partial"
 
 
-@dataclass
+@dataclass(slots=True)
 class Node:
     """A filesystem entry and its measured, on-disk usage."""
 
@@ -29,6 +29,7 @@ class Node:
     children: list[Node] = field(default_factory=list)
     size_is_partial: bool = False
     selectable: bool = True
+    aggregate_count: int = 0
 
     def __post_init__(self) -> None:
         if self.size_bytes < 0:
@@ -80,7 +81,10 @@ class SelectionModel:
 
     @property
     def estimated_size_bytes(self) -> int:
-        nodes = {node.path: node for root in self.roots for node in _walk(root)}
+        nodes = {
+            node.path: node for root in self.roots for node in _walk(root)
+            if node.selectable
+        }
         return sum(nodes[path].size_bytes for path in self.selected_paths if path in nodes)
 
 

@@ -22,7 +22,10 @@ Clearspace stores a structured, local JSONL action history at `~/.local/share/cl
 - The GTK-free tree scanner measures the complete tree in a background thread before
   presenting it, includes hidden files, counts allocated disk blocks, counts hardlinked
   files once, and never follows symlinks.
-- Scanner errors remain attached to their nodes, and every readable entry remains visible.
+- Scanner errors remain attached to their nodes. Each directory retains its 100 largest
+  children plus an informational aggregate row for the rest. GTK row objects are created
+  only when a directory is expanded. The scan report shows scan duration, GTK model-build
+  time, time until the tree is mapped, and process peak RSS.
 - A GTK-free rule engine classifies caches, builds, personal data, credentials, repositories,
   browser profiles, game data, and container volumes. It reports Git worktree changes and
   recommends installed native procedures; administrator procedures are copy-only.
