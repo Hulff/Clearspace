@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 import os
+import errno
 import shutil
 import stat
 import time
@@ -84,10 +85,12 @@ def build_review(
     allowed_root: Path,
     risks: dict[Path, Risk] | None = None,
     warnings: dict[Path, tuple[str, ...]] | None = None,
-    active_paths: tuple[Path, ...] = (),
+    active_paths: tuple[Path, ...] | None = None,
 ) -> CleanupReview:
     """Validate and measure a minimal, reviewed set of paths under a root."""
     root = _canonical_root(allowed_root)
+    if active_paths is None:
+        active_paths = discover_active_paths(root)
     risks = risks or {}
     warnings = warnings or {}
     validated: list[tuple[Path, Path, os.stat_result]] = []
@@ -111,6 +114,83 @@ def build_review(
                          tuple(Path(path).resolve(strict=False) for path in active_paths))
 
 
+def discover_active_paths(allowed_root: Path) -> tuple[Path, ...]:
+    """Find open files and working directories under a scan root via procfs.
+
+    This reads link targets only; it never opens application files. Call again
+    immediately before each item so newly active paths are protected too.
+    """
+    root = allowed_root.resolve(strict=True)
+    proc = Path("/proc")
+    active: set[Path] = set()
+    try:
+        processes = tuple(proc.iterdir())
+    except OSError as error:
+        logger.warning("Could not inspect procfs for active paths: %s", error)
+        raise RuntimeError(f"Não foi possível verificar dados ativos em /proc: {error}") from error
+    for process in processes:
+        if not process.name.isdecimal():
+            continue
+        try:
+            status = (process / "status").read_text(encoding="ascii")
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            # /proc entries are inherently racy: a process may exit or become
+            # inaccessible after enumeration. Its vanished descriptors cannot
+            # keep files active, so skip that process and continue scanning.
+            if error.errno in {errno.ENOENT, errno.ESRCH, errno.EACCES, errno.EPERM}:
+                continue
+            raise RuntimeError(
+                f"Não foi possível verificar processos ativos ({process.name}): {error}"
+            ) from error
+        uid_line = next((line for line in status.splitlines() if line.startswith("Uid:")), None)
+        if uid_line is None:
+            raise RuntimeError(f"Não foi possível determinar o usuário do processo {process.name}")
+        try:
+            process_uids = {int(value) for value in uid_line.split()[1:4]}
+        except ValueError as error:
+            raise RuntimeError(f"UID inválido no processo {process.name}") from error
+        if os.getuid() not in process_uids and os.geteuid() not in process_uids:
+            continue
+        sources = [process / "cwd"]
+        try:
+            sources.extend((process / "fd").iterdir())
+        except FileNotFoundError:
+            continue
+        except OSError as error:
+            if error.errno in {errno.ENOENT, errno.ESRCH, errno.EACCES, errno.EPERM}:
+                continue
+            raise RuntimeError(
+                f"Não foi possível inspecionar descritores do processo {process.name}: {error}"
+            ) from error
+        for source in sources:
+            try:
+                raw_target = os.readlink(source)
+            except FileNotFoundError:
+                continue
+            except OSError as error:
+                if error.errno in {
+                    errno.ENOENT, errno.ESRCH, errno.EACCES, errno.EPERM,
+                }:
+                    continue
+                raise RuntimeError(
+                    f"Não foi possível verificar caminho ativo {source}: {error}"
+                ) from error
+            if raw_target.endswith(" (deleted)"):
+                raw_target = raw_target[:-10]
+            target = Path(raw_target)
+            if not target.is_absolute():
+                continue
+            try:
+                canonical = target.resolve(strict=False)
+                canonical.relative_to(root)
+            except (OSError, ValueError):
+                continue
+            active.add(canonical)
+    return tuple(sorted(active))
+
+
 class ItemExecutor:
     """Revalidate each reviewed item immediately before its single action."""
 
@@ -119,7 +199,7 @@ class ItemExecutor:
         history: HistorySink,
         *,
         trash: TrashAdapter | None = None,
-        active_paths: Callable[[], tuple[Path, ...]] | tuple[Path, ...] = (),
+        active_paths: Callable[[], tuple[Path, ...]] | tuple[Path, ...] | None = None,
     ) -> None:
         self.history = history
         self.trash = trash or GioTrash()
@@ -139,14 +219,19 @@ class ItemExecutor:
         item = next((candidate for candidate in review.items if candidate.path == path), None)
         if item is None:
             raise ValueError("O item não pertence à revisão confirmada")
-        current_active = self.active_paths() if callable(self.active_paths) else self.active_paths
-        active_paths = tuple(review.active_paths) + tuple(current_active)
         started_at = time.time()
         before_df = _disk_usage_record(review.allowed_root)
         failure: str | None = None
         size_at_execution = item.size_bytes
 
         try:
+            if self.active_paths is None:
+                current_active = discover_active_paths(review.allowed_root)
+            else:
+                current_active = (
+                    self.active_paths() if callable(self.active_paths) else self.active_paths
+                )
+            active_paths = tuple(review.active_paths) + tuple(current_active)
             if item.risk is Risk.CRITICAL:
                 raise UnsafePathError("Risco crítico bloqueia qualquer exclusão")
             if item.risk is Risk.USER_DATA and not user_data_confirmed:

@@ -50,13 +50,16 @@ def directory_size(path: Path) -> DirectorySize:
         logger.warning("Could not read during scan: %s", message)
 
     try:
-        root_device = path.stat().st_dev
+        root_info = path.lstat()
     except FileNotFoundError as error:
         record_error(error)
         return DirectorySize(0, tuple(errors), missing=True)
     except OSError as error:
         record_error(error)
         return DirectorySize(0, tuple(errors))
+    if stat.S_ISLNK(root_info.st_mode):
+        return DirectorySize(root_info.st_size)
+    root_device = root_info.st_dev
 
     try:
         for current, dirs, files in os.walk(path, followlinks=False, onerror=record_error):
@@ -113,9 +116,24 @@ class Candidate:
     partial: bool = False
 
 
+def inspection_only_paths(home: Path | None = None) -> tuple[Path, ...]:
+    """Return data-bearing registry roots that must remain inspection-only."""
+    home = home or Path.home()
+    return tuple(home / relative for relative in (
+        ".local/share/Trash",
+        ".cache/huggingface",
+        ".local/share/PrismLauncher",
+        ".config/Postman",
+        ".gradle",
+        ".codex",
+        ".cache/yay",
+    ))
+
+
 def discover_candidates() -> list[Candidate]:
     home = Path.home()
     candidates: list[Candidate] = []
+    inspection_paths = inspection_only_paths(home)
 
     def add_path(key: str, title: str, path: Path, description: str, risk: str) -> None:
         result = directory_size(path)
@@ -137,19 +155,19 @@ def discover_candidates() -> list[Candidate]:
              "Compiled build artifacts. Go rebuilds them as needed.", "Low risk")
     add_path("vscode-cpp", "VS Code C/C++ index cache", home / ".cache/vscode-cpptools",
              "Extension indexing data. Close VS Code first; indexes will be rebuilt.", "Moderate risk")
-    add_path("trash", "Trash", home / ".local/share/Trash",
+    add_path("trash", "Trash", inspection_paths[0],
              "Files here may still be wanted. Review them in your file manager.", "Personal data · inspect only")
-    add_path("huggingface", "Hugging Face files", home / ".cache/huggingface",
+    add_path("huggingface", "Hugging Face files", inspection_paths[1],
              "May contain large models and datasets that are expensive to download again.", "Personal data · inspect only")
-    add_path("prism", "PrismLauncher data", home / ".local/share/PrismLauncher",
+    add_path("prism", "PrismLauncher data", inspection_paths[2],
              "May contain Minecraft worlds, instances, and modpacks.", "Personal data · inspect only")
-    add_path("postman", "Postman data", home / ".config/Postman",
+    add_path("postman", "Postman data", inspection_paths[3],
              "May contain local settings, workspaces, and application data.", "Personal data · inspect only")
-    add_path("gradle", "Gradle data", home / ".gradle",
+    add_path("gradle", "Gradle data", inspection_paths[4],
              "May contain build caches, wrapper distributions, and project state.", "Personal data · inspect only")
-    add_path("codex", "Codex data", home / ".codex",
+    add_path("codex", "Codex data", inspection_paths[5],
              "May contain local configuration and user data.", "Personal data · inspect only")
-    add_path("yay", "yay package cache", home / ".cache/yay",
+    add_path("yay", "yay package cache", inspection_paths[6],
              "May contain package build files and cached sources.", "Personal data · inspect only")
 
     if shutil.which("go"):

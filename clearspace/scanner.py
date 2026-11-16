@@ -1,10 +1,11 @@
-"""GTK-free, lazy filesystem tree scanner for Clearspace."""
+"""GTK-free filesystem tree scanner for Clearspace."""
 
 from __future__ import annotations
 
 import logging
 import os
 import stat
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -15,44 +16,97 @@ logger = logging.getLogger(__name__)
 
 @dataclass
 class TreeScanner:
-    """Read one directory level at a time without following links.
+    """Read a complete tree without following links.
 
-    Directory sizes are accumulated during expansion. A directory node's
-    initial size is its own allocated metadata; after expansion it is updated
-    to include the entries measured in its children. Results can be handed to
-    a GTK adapter which schedules model changes with GLib.idle_add.
+    The caller should run ``scan_root`` in a worker thread and hand the
+    resulting tree to the UI only after the scan finishes.
     """
 
     root_path: Path
     max_visible_children: int = 200
     _root_device: int | None = field(default=None, init=False, repr=False)
     _seen_inodes: set[tuple[int, int]] = field(default_factory=set, init=False, repr=False)
+    _root_node: Node | None = field(default=None, init=False, repr=False)
+    _directory_metadata_bytes: dict[Path, int] = field(default_factory=dict, init=False, repr=False)
+    report: dict[str, int | float] = field(default_factory=dict, init=False)
 
     def scan_root(self) -> Node:
-        """Create the root node and enumerate only its immediate children."""
+        """Create the root node and measure every reachable directory."""
+        started = time.monotonic()
+        self.report = {
+            "directories": 0,
+            "files": 0,
+            "errors": 0,
+            "symlinks_skipped": 0,
+            "other_filesystems_skipped": 0,
+            "allocated_bytes": 0,
+        }
+        root_path = Path(os.path.abspath(self.root_path))
+        current = Path(root_path.anchor)
+        for component in root_path.parts[1:]:
+            current = current / component
+            try:
+                info = current.lstat()
+            except OSError as error:
+                self._log_error(current, error)
+                return Node(root_path, root_path.name, True, 0,
+                            error=self._error_text(error), children_loaded=True,
+                            selectable=False)
+            if stat.S_ISLNK(info.st_mode):
+                return Node(root_path, root_path.name, True, 0,
+                            error=f"symlink não seguido: {current}", children_loaded=True,
+                            selectable=False)
+        self.root_path = root_path
         root = self._node_for(self.root_path, is_root=True)
-        self.expand(root)
+        root.selectable = False
+        self._root_node = root
+        self._expand_recursively(root)
+        self.report["allocated_bytes"] = root.size_bytes
+        self.report["elapsed_seconds"] = round(time.monotonic() - started, 3)
         return root
+
+    def _expand_recursively(self, node: Node) -> None:
+        if not node.is_dir or node.children_loaded:
+            return
+        self.expand(node)
+        for child in node.children:
+            if child.is_dir:
+                self._expand_recursively(child)
+        if node.children_loaded:
+            node.size_bytes = self._directory_metadata_bytes.get(node.path, 0) + sum(
+                child.size_bytes for child in node.children
+            )
 
     def expand(self, node: Node) -> list[Node]:
         """Load one directory level, sorting largest entries first."""
         if not node.is_dir or node.children_loaded:
             return node.children
+        directory_fd = None
         try:
-            with os.scandir(node.path) as iterator:
-                entries = list(iterator)
+            directory_fd = self._open_directory_fd(node.path)
+            with os.scandir(directory_fd) as iterator:
+                entries = []
+                for entry in iterator:
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                        entries.append((entry.name, info, None))
+                    except OSError as error:
+                        entries.append((entry.name, None, error))
         except OSError as error:
             self._set_error(node, error)
             node.children_loaded = True
             return node.children
+        finally:
+            if directory_fd is not None:
+                os.close(directory_fd)
 
         children: list[Node] = []
-        for entry in entries:
-            path = Path(entry.path)
-            try:
-                info = entry.stat(follow_symlinks=False)
-            except OSError as error:
-                child = Node(path, entry.name, False, 0, error=self._error_text(error))
+        for name, info, error in entries:
+            path = node.path / name
+            if error:
+                self.report["errors"] += 1
+                child = Node(path, name, False, 0, error=self._error_text(error),
+                             selectable=False)
                 children.append(child)
                 self._log_error(path, error)
                 continue
@@ -60,34 +114,49 @@ class TreeScanner:
             if stat.S_ISLNK(info.st_mode):
                 # Symlink targets are never inspected and symlink nodes are not
                 # selectable for cleanup through the tree scanner.
+                self.report["symlinks_skipped"] += 1
                 continue
             if info.st_dev != self._root_device:
+                self.report["other_filesystems_skipped"] += 1
                 continue
 
             size = self._allocated_size(info, path)
-            child = Node(path, entry.name, stat.S_ISDIR(info.st_mode), size)
+            child = Node(path, name, stat.S_ISDIR(info.st_mode), size)
+            self.report["directories" if child.is_dir else "files"] += 1
             children.append(child)
 
         children.sort(key=lambda item: item.size_bytes, reverse=True)
-        total_count = len(children)
-        if total_count > self.max_visible_children:
-            visible = children[: self.max_visible_children]
-            hidden = children[self.max_visible_children :]
-            hidden_size = sum(item.size_bytes for item in hidden)
-            visible.append(Node(
-                path=node.path,
-                name=f"{len(hidden)} itens menores",
-                is_dir=False,
-                size_bytes=hidden_size,
-                children_loaded=True,
-                selectable=False,
-            ))
-            children = visible
+        # Keep every real entry visible. Large directories are already scanned
+        # in the background, so hiding rows would obscure the full inventory.
 
         node.children = children
         node.children_loaded = True
         node.size_bytes = sum(child.size_bytes for child in children)
+        if self._root_node is not None:
+            self._recalculate_loaded_sizes(self._root_node)
         return children
+
+    def _open_directory_fd(self, path: Path) -> int:
+        """Open a tree directory from its root using O_NOFOLLOW at each step."""
+        relative = path.relative_to(self.root_path)
+        flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory_fd = os.open(self.root_path, flags)
+        try:
+            for component in relative.parts:
+                next_fd = os.open(component, flags, dir_fd=directory_fd)
+                os.close(directory_fd)
+                directory_fd = next_fd
+            return directory_fd
+        except Exception:
+            os.close(directory_fd)
+            raise
+
+    def _recalculate_loaded_sizes(self, node: Node) -> int:
+        if node.is_dir and node.children_loaded:
+            node.size_bytes = self._directory_metadata_bytes.get(node.path, 0) + sum(
+                self._recalculate_loaded_sizes(child) for child in node.children
+            )
+        return node.size_bytes
 
     def _node_for(self, path: Path, *, is_root: bool = False) -> Node:
         try:
@@ -106,7 +175,11 @@ class TreeScanner:
                         error="filesystem diferente; ignorado")
 
         is_dir = stat.S_ISDIR(info.st_mode)
+        if is_dir:
+            self.report["directories"] += 1
+            self._directory_metadata_bytes[path] = info.st_blocks * 512
         if not is_dir:
+            self.report["files"] += 1
             size = self._allocated_size(info, path)
             return Node(path, path.name, False, size, children_loaded=True)
         return Node(path, path.name or str(path), True, self._allocated_size(info, path),
@@ -123,8 +196,10 @@ class TreeScanner:
         return info.st_blocks * 512
 
     def _set_error(self, node: Node, error: OSError) -> None:
+        self.report["errors"] += 1
         node.error = self._error_text(error)
         node.size_is_partial = node.size_bytes > 0
+        node.selectable = False
         self._log_error(node.path, error)
 
     @staticmethod

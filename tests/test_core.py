@@ -28,6 +28,19 @@ def test_counts_symlink_without_following_it(tmp_path: Path) -> None:
     assert result.errors == ()
 
 
+def test_symlink_scan_root_does_not_read_target(tmp_path: Path) -> None:
+    target = tmp_path / "target"
+    target.mkdir()
+    (target / "payload").write_bytes(b"payload")
+    link = tmp_path / "root-link"
+    link.symlink_to(target, target_is_directory=True)
+
+    result = directory_size(link)
+
+    assert result.bytes == link.lstat().st_size
+    assert result.errors == ()
+
+
 def test_permission_error_is_reported(tmp_path: Path) -> None:
     import os
     import pytest

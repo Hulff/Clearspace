@@ -9,7 +9,7 @@ from clearspace.contracts import SelectionModel
 from clearspace.scanner import TreeScanner
 
 
-def test_scans_hidden_entries_and_expands_lazily(tmp_path: Path) -> None:
+def test_scans_complete_tree_and_includes_hidden_entries(tmp_path: Path) -> None:
     root_path = tmp_path / "root"
     child_path = root_path / ".hidden"
     child_path.mkdir(parents=True)
@@ -20,10 +20,12 @@ def test_scans_hidden_entries_and_expands_lazily(tmp_path: Path) -> None:
 
     assert root.children_loaded
     hidden = next(node for node in root.children if node.name == ".hidden")
-    assert not hidden.children_loaded
-    payload = scanner.expand(hidden)
-    assert [node.name for node in payload] == ["payload"]
     assert hidden.children_loaded
+    assert [node.name for node in hidden.children] == ["payload"]
+    assert hidden.children_loaded
+    assert scanner.report["files"] == 1
+    assert scanner.report["directories"] == 2
+    assert scanner.report["elapsed_seconds"] >= 0
 
 
 def test_symlink_targets_are_not_followed(tmp_path: Path) -> None:
@@ -77,12 +79,13 @@ def test_hardlinks_count_once_and_large_directories_aggregate(tmp_path: Path) ->
     for index in range(3):
         (root_path / f"file-{index}").write_bytes(b"x")
 
-    root = TreeScanner(root_path, max_visible_children=2).scan_root()
-    aggregate = next(node for node in root.children if node.name.endswith("itens menores"))
+    scanner = TreeScanner(root_path, max_visible_children=2)
+    root = scanner.scan_root()
+    files = [node for node in root.children if node.name.startswith("file-")]
     selection = SelectionModel([root])
-    selection.set_checked(aggregate, True)
+    selection.set_checked(files[0], True)
 
-    assert aggregate.selectable is False
-    assert selection.selected_paths == ()
-    assert len(root.children) == 3  # 2 visible entries + aggregate
+    assert selection.selected_paths == (files[0].path,)
+    assert len(root.children) == 5
     assert root.size_bytes > 0
+    assert scanner.report["files"] == 5

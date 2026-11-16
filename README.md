@@ -8,6 +8,10 @@ Clearspace is a local-first Linux disk cleanup app. It measures common disk cons
 python app.py
 ```
 
+Na primeira abertura, a árvore começa em `/home`, para mostrar as pastas de
+usuários diretamente. Caminhos de cada usuário e dados de aplicações ativas
+continuam sujeitos às proteções do executor.
+
 GTK 4 and its Python bindings (`python-gobject`) are required. On Arch Linux, install them with `sudo pacman -S gtk4 python-gobject`.
 
 Clearspace stores a structured, local JSONL action history at `~/.local/share/clearspace/history.jsonl`. It records action IDs, measured sizes, timestamps, command arguments, exit status, and output. It does not store file contents or send data over the network. This history format is intended to provide a future retrieval layer for personalized recommendations; no LLM or RAG functionality is included yet.
@@ -15,10 +19,10 @@ Clearspace stores a structured, local JSONL action history at `~/.local/share/cl
 ## Safety
 
 - Scanning is read-only and stays on the filesystem containing the scanned path.
-- The GTK-free tree scanner loads one directory level on demand, includes hidden files,
-  counts allocated disk blocks, counts hardlinked files once, and never follows symlinks.
-- Scanner errors remain attached to their nodes; large directories collapse the remaining
-  entries into a non-selectable informational row.
+- The GTK-free tree scanner measures the complete tree in a background thread before
+  presenting it, includes hidden files, counts allocated disk blocks, counts hardlinked
+  files once, and never follows symlinks.
+- Scanner errors remain attached to their nodes, and every readable entry remains visible.
 - A GTK-free rule engine classifies caches, builds, personal data, credentials, repositories,
   browser profiles, game data, and container volumes. It reports Git worktree changes and
   recommends installed native procedures; administrator procedures are copy-only.
