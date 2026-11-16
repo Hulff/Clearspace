@@ -62,7 +62,7 @@ def test_procedure_availability_and_admin_copy_only(monkeypatch: pytest.MonkeyPa
 
     assert normal.available
     assert normal.command_to_copy is None
-    assert not admin.available
+    assert admin.available
     assert admin.command_to_copy == ("tool", "clean")
 
 

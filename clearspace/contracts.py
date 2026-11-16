@@ -150,9 +150,7 @@ class Procedure:
 
     @property
     def available(self) -> bool:
-        """Whether the declared tool is present; admin actions remain non-executable."""
-        if self.requires_admin:
-            return False
+        """Whether the declared tool is installed, regardless of execution policy."""
         tool = self.executable or self.argv[0]
         return shutil.which(tool) is not None
 

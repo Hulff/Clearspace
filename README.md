@@ -19,6 +19,9 @@ Clearspace stores a structured, local JSONL action history at `~/.local/share/cl
   counts allocated disk blocks, counts hardlinked files once, and never follows symlinks.
 - Scanner errors remain attached to their nodes; large directories collapse the remaining
   entries into a non-selectable informational row.
+- A GTK-free rule engine classifies caches, builds, personal data, credentials, repositories,
+  browser profiles, game data, and container volumes. It reports Git worktree changes and
+  recommends installed native procedures; administrator procedures are copy-only.
 - Cleanup runs one native command at a time, with a confirmation dialog showing the command and expected impact.
 - Data-bearing targets such as Trash, Docker volumes, browser profiles, model downloads, and project directories are inspection-only.
 - The app does not invoke a shell or request administrator privileges.
