@@ -52,10 +52,20 @@ class RustTreeScanner:
             if cache_inside_scan_root:
                 cache_root = None
         if cache_root is not None:
-            cache_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        self._temporary_directory = tempfile.TemporaryDirectory(
-            prefix="scan-", dir=cache_root
-        )
+            try:
+                cache_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+            except OSError:
+                if cache_dir is not None:
+                    raise
+                cache_root = None
+        try:
+            self._temporary_directory = tempfile.TemporaryDirectory(
+                prefix="scan-", dir=cache_root
+            )
+        except OSError:
+            if cache_dir is not None or cache_root is None:
+                raise
+            self._temporary_directory = tempfile.TemporaryDirectory(prefix="scan-")
         self.database_path = Path(self._temporary_directory.name) / "inventory.sqlite"
         self.exclusions = tuple(exclusions)
         self.report: dict[str, int | float | str] = {}

@@ -21,6 +21,7 @@ struct Counts {
     symlinks_skipped: u64,
     other_filesystems_skipped: u64,
     allocated_bytes: u64,
+    first_progress_ms: Option<u128>,
 }
 
 struct TempDatabase(PathBuf);
@@ -97,13 +98,47 @@ fn insert(conn: &Connection, row: NodeRow<'_>) -> rusqlite::Result<i64> {
         "INSERT INTO scan_paths(path,id,depth) VALUES (?1,?2,?3)",
         params![row.path.to_string_lossy(), id, row.depth as i64],
     )?;
-    if let Some(parent) = row.parent_id {
-        conn.execute("WITH RECURSIVE ancestors(id,parent_id) AS (SELECT id,parent_id FROM nodes WHERE id=?1 UNION ALL SELECT n.id,n.parent_id FROM nodes n JOIN ancestors a ON n.id=a.parent_id) UPDATE nodes SET size_blocks=size_blocks+?2 WHERE id IN (SELECT id FROM ancestors WHERE is_dir=1)", params![parent, row.blocks as i64])?;
-        if row.partial {
-            conn.execute("WITH RECURSIVE ancestors(id,parent_id) AS (SELECT id,parent_id FROM nodes WHERE id=?1 UNION ALL SELECT n.id,n.parent_id FROM nodes n JOIN ancestors a ON n.id=a.parent_id) UPDATE nodes SET partial=1 WHERE id IN (SELECT id FROM ancestors)", [parent])?;
-        }
-    }
     Ok(id)
+}
+
+fn aggregate_directories(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE INDEX nodes_parent_idx ON nodes(parent_id);
+         UPDATE nodes SET
+           size_blocks=size_blocks+COALESCE((SELECT SUM(child.size_blocks) FROM nodes child WHERE child.parent_id=nodes.id AND child.is_dir=0),0),
+           partial=CASE WHEN EXISTS(SELECT 1 FROM nodes child WHERE child.parent_id=nodes.id AND child.partial=1) THEN 1 ELSE partial END
+         WHERE is_dir=1;",
+    )
+    .map_err(|error| format!("aggregate direct children: {error}"))?;
+
+    let directories: Vec<(i64, Option<i64>)> = {
+        let mut statement = conn
+            .prepare("SELECT nodes.id,nodes.parent_id FROM nodes JOIN scan_paths ON scan_paths.id=nodes.id WHERE nodes.is_dir=1 ORDER BY scan_paths.depth DESC")
+            .map_err(|error| format!("prepare directory aggregation: {error}"))?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(|error| format!("read directory aggregation order: {error}"))?;
+        rows.collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("collect directory aggregation order: {error}"))?
+    };
+    for (directory_id, parent_id) in directories {
+        let Some(parent_id) = parent_id else { continue };
+        let (blocks, partial): (i64, bool) = conn
+            .query_row(
+                "SELECT size_blocks,partial FROM nodes WHERE id=?1",
+                [directory_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(|error| format!("read directory total: {error}"))?;
+        conn.execute(
+            "UPDATE nodes SET size_blocks=size_blocks+?1,partial=CASE WHEN ?2 THEN 1 ELSE partial END WHERE id=?3",
+            params![blocks, partial, parent_id],
+        )
+        .map_err(|error| format!("propagate directory total: {error}"))?;
+    }
+    conn.execute_batch("DROP INDEX nodes_parent_idx")
+        .map_err(|error| format!("drop temporary aggregation index: {error}"))?;
+    Ok(())
 }
 
 fn mtime_ns(metadata: &fs::Metadata) -> i64 {
@@ -253,6 +288,7 @@ fn process(
                 }
             });
         });
+    let progress_started = Instant::now();
     let mut batch = 0u64;
     for item in walker.try_into_iter().map_err(|e| format!("walker: {e}"))? {
         let entry = match item {
@@ -376,6 +412,9 @@ fn process(
         }
         batch += 1;
         if batch >= 1000 {
+            if counts.first_progress_ms.is_none() {
+                counts.first_progress_ms = Some(progress_started.elapsed().as_millis());
+            }
             conn.execute_batch("COMMIT; BEGIN IMMEDIATE")
                 .map_err(|e| format!("commit batch: {e}"))?;
             emit(
@@ -389,6 +428,7 @@ fn process(
             batch = 0;
         }
     }
+    aggregate_directories(&conn)?;
     counts.other_filesystems_skipped = skipped_mounts.load(Ordering::Relaxed);
     counts.symlinks_skipped = skipped_symlinks.load(Ordering::Relaxed);
     conn.execute_batch("DROP TABLE scan_paths; CREATE INDEX nodes_parent_size_idx ON nodes(parent_id,size_blocks DESC); COMMIT;")
@@ -419,15 +459,21 @@ fn main() {
     }
     match process(&root, &db, &excludes) {
         Ok((c, root_id)) => {
+            let first_progress_ms = c
+                .first_progress_ms
+                .map_or_else(|| "null".to_owned(), |value| value.to_string());
             let fields = format!(
-                ",\"root_id\":{root_id},\"nodes\":{},\"directories\":{},\"files\":{},\"errors\":{},\"symlinks_skipped\":{},\"other_filesystems_skipped\":{},\"allocated_bytes\":{},\"duration_ms\":{}",
+                ",\"root_id\":{root_id},\"nodes\":{},\"directories\":{},\"dirs\":{},\"files\":{},\"errors\":{},\"symlinks_skipped\":{},\"other_filesystems_skipped\":{},\"allocated_bytes\":{},\"bytes\":{},\"first_progress_ms\":{},\"duration_ms\":{}",
                 c.nodes,
+                c.directories,
                 c.directories,
                 c.files,
                 c.errors,
                 c.symlinks_skipped,
                 c.other_filesystems_skipped,
                 c.allocated_bytes,
+                c.allocated_bytes,
+                first_progress_ms,
                 started.elapsed().as_millis()
             );
             let _ = emit("completed", &fields);
