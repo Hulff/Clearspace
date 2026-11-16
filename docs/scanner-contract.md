@@ -115,16 +115,18 @@ scanner-independent `ProgressEvent`. A future scanner process that emits live
 folder progress uses JSONL protocol version 2, one object per line:
 
 ```jsonl
-{"protocol_version":2,"event":"progress","dirs_done":43,"dirs_total_est":428,"files":2048,"bytes":73400320,"elapsed_ms":1200,"current_path":"/scan/root/example","state":"running","partial":false}
-{"protocol_version":2,"event":"progress","dirs_done":43,"dirs_total_est":441,"files":2100,"bytes":75497472,"elapsed_ms":1300,"current_path":"/scan/root/another","state":"running","partial":false}
-{"protocol_version":2,"event":"completed","dirs_done":441,"dirs_total_est":441,"files":2177,"bytes":75497472,"elapsed_ms":1500,"state":"done","partial":false}
+{"protocol_version":2,"event":"progress","dirs_done":43,"dirs_total_est":428,"files":2048,"bytes":73400320,"elapsed_ms":1200,"current_path":"/scan/root/example","largest_items":[{"name":"example","path":"/scan/root/example","bytes":7340032}],"state":"running","partial":false}
+{"protocol_version":2,"event":"progress","dirs_done":43,"dirs_total_est":441,"files":2100,"bytes":75497472,"elapsed_ms":1300,"current_path":"/scan/root/another","largest_items":[{"name":"example","path":"/scan/root/example","bytes":7340032}],"state":"running","partial":false}
+{"protocol_version":2,"event":"completed","dirs_done":441,"dirs_total_est":441,"files":2177,"bytes":75497472,"elapsed_ms":1500,"largest_items":[],"state":"done","partial":false}
 ```
 
 `dirs_total_est` is nullable and may increase as directories are discovered.
 When it is null, clients show indeterminate progress. `dirs_done`, `files`,
 `bytes`, and `elapsed_ms` are nonnegative cumulative values; `bytes` means
 allocated bytes (`st_blocks * 512`). `current_path` is local display data only;
-it is untrusted and cannot authorize an action. `state` is one of `running`,
+it is untrusted and cannot authorize an action. `largest_items` is an optional
+bounded list of up to four observed entries with display name, local path, and
+allocated bytes; consumers never use it to authorize an action. `state` is one of `running`,
 `paused`, `cancelled`, `done`, or `error`. Cancellation is cooperative and a
 terminal `cancelled` event sets `partial` to true; the partial inventory remains
 available.

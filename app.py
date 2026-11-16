@@ -17,6 +17,15 @@ from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
 from clearspace.contracts import Node, Risk, SelectionModel, SelectionState
 from clearspace.core import History, format_bytes, inspection_only_paths
+from clearspace.progress import (
+    EtaEstimator,
+    ProgressEvent,
+    ScanController,
+    ScanState,
+    format_elapsed,
+    format_size_gib,
+    progress_percent,
+)
 from clearspace.executor import (
     PERMANENT_CONFIRMATION,
     CleanupReview,
@@ -27,7 +36,6 @@ from clearspace.executor import (
     discover_active_paths,
 )
 from clearspace.rules import RuleEngine, RuleEvaluation
-from clearspace.rust_scanner import RustTreeScanner
 from clearspace.scanner import TreeScanner
 
 
@@ -66,16 +74,25 @@ class Clearspace(Gtk.Application):
         self.size_sorter = None
         self._scan_generation = 0
         self._scan_started_at = 0.0
+        self.scan_controller = ScanController()
+        self._scan_poll_source = None
+        self._scan_eta = EtaEstimator()
+        self._scan_largest_items = ()
+        self._scan_last_top_render = 0.0
 
     def do_activate(self):
         self.window = Gtk.ApplicationWindow(application=self, title="Clearspace")
         self.window.set_default_size(1280, 820)
+        self._install_theme()
+        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
+        self.window.set_child(self.stack)
+        self._build_scanning_screen()
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         outer.set_margin_top(20)
         outer.set_margin_bottom(16)
         outer.set_margin_start(20)
         outer.set_margin_end(20)
-        self.window.set_child(outer)
+        self.stack.add_named(outer, "results")
 
         heading = Gtk.Label(label="Clearspace · Uso do disco")
         heading.add_css_class("title-1")
@@ -92,6 +109,15 @@ class Clearspace(Gtk.Application):
         self.disk_label.set_xalign(0)
         self.disk_label.add_css_class("heading")
         outer.append(self.disk_label)
+        self.partial_banner = Gtk.Box(spacing=10)
+        self.partial_banner.add_css_class("scan-chip")
+        partial_label = Gtk.Label(label="These are partial results.", xalign=0, hexpand=True)
+        self.partial_banner.append(partial_label)
+        self.partial_scan_button = Gtk.Button(label="Scan again")
+        self.partial_scan_button.connect("clicked", lambda *_: self.scan())
+        self.partial_banner.append(self.partial_scan_button)
+        self.partial_banner.set_visible(False)
+        outer.append(self.partial_banner)
 
         scan_bar = Gtk.Box(spacing=8)
         self.scan_button = Gtk.Button(label="Atualizar árvore")
@@ -131,6 +157,122 @@ class Clearspace(Gtk.Application):
         self.scan()
         self.window.present()
 
+    def _install_theme(self):
+        css = """
+        * { font-family: Inter, sans-serif; color: #eceeef; }
+        window, .clearspace-root { background: #181a1b; }
+        .scan-card, .scan-stat { background: #232627; border: 1px solid #34383a;
+            border-radius: 14px; }
+        .scan-card { padding: 22px; }
+        .scan-stat { padding: 14px; }
+        .scan-muted { color: #a9b0b3; }
+        .scan-accent { color: #5aa9ff; }
+        progressbar trough { min-height: 14px; border-radius: 8px; background: #34383a; }
+        progressbar progress { min-height: 14px; border-radius: 8px; background: #5aa9ff; }
+        button { min-height: 40px; }
+        .scan-current-path { font-family: monospace; color: #a9b0b3; }
+        .scan-chip { background: #1c1f20; border-radius: 8px; padding: 8px 10px; }
+        """
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css.encode("utf-8"))
+        display = Gdk.Display.get_default()
+        if display is not None:
+            Gtk.StyleContext.add_provider_for_display(
+                display, provider, Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION
+            )
+        self._css_provider = provider
+
+    def _build_scanning_screen(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=24)
+        page.add_css_class("clearspace-root")
+        page.set_halign(Gtk.Align.FILL)
+        page.set_valign(Gtk.Align.FILL)
+        page.set_margin_top(36)
+        page.set_margin_bottom(30)
+        page.set_margin_start(40)
+        page.set_margin_end(40)
+
+        title = Gtk.Label(label="Scanning your disk…", xalign=0)
+        title.add_css_class("title-1")
+        page.append(title)
+        self.scan_subtitle = Gtk.Label(xalign=0, wrap=True)
+        self.scan_subtitle.add_css_class("scan-muted")
+        page.append(self.scan_subtitle)
+
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        card.add_css_class("scan-card")
+        page.append(card)
+        progress_header = Gtk.Box(spacing=12)
+        card.append(progress_header)
+        self.scan_counter_label = Gtk.Label(xalign=0, hexpand=True)
+        self.scan_counter_label.add_css_class("title-2")
+        progress_header.append(self.scan_counter_label)
+        self.scan_percent_label = Gtk.Label(label="", xalign=1)
+        self.scan_percent_label.add_css_class("title-2")
+        self.scan_percent_label.add_css_class("scan-accent")
+        progress_header.append(self.scan_percent_label)
+        self.scan_progress_bar = Gtk.ProgressBar(hexpand=True)
+        self.scan_progress_bar.set_show_text(False)
+        self._set_accessible_label(self.scan_progress_bar, "Scan progress")
+        card.append(self.scan_progress_bar)
+
+        stats = Gtk.Grid(column_spacing=12, row_spacing=12)
+        stats.set_column_homogeneous(True)
+        for index, (heading, attribute) in enumerate((
+            ("Files analyzed", "scan_files_value"),
+            ("Measured", "scan_bytes_value"),
+            ("Elapsed", "scan_elapsed_value"),
+            ("Time left · estimate", "scan_eta_value"),
+        )):
+            tile = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            tile.add_css_class("scan-stat")
+            label = Gtk.Label(label=heading, xalign=0)
+            label.add_css_class("scan-muted")
+            value = Gtk.Label(label="—", xalign=0)
+            value.add_css_class("title-3")
+            tile.append(label)
+            tile.append(value)
+            setattr(self, attribute, value)
+            stats.attach(tile, index, 0, 1, 1)
+        card.append(stats)
+
+        self.scan_path_label = Gtk.Label(xalign=0, wrap=False, ellipsize=2)
+        self.scan_path_label.add_css_class("scan-current-path")
+        card.append(self.scan_path_label)
+
+        biggest_title = Gtk.Label(label="Biggest so far", xalign=0)
+        biggest_title.add_css_class("heading")
+        card.append(biggest_title)
+        self.scan_biggest_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
+        card.append(self.scan_biggest_box)
+
+        controls = Gtk.Box(spacing=10)
+        self.scan_pause_button = Gtk.Button(label="Pause")
+        self.scan_pause_button.connect("clicked", self._toggle_scan_pause)
+        controls.append(self.scan_pause_button)
+        self.scan_cancel_button = Gtk.Button(label="Cancel")
+        self.scan_cancel_button.connect("clicked", self._cancel_scan)
+        controls.append(self.scan_cancel_button)
+        card.append(controls)
+        footnote = Gtk.Label(
+            label=(
+                "Time left is an estimate. The estimated folder total can change "
+                "as new folders are found."
+            ),
+            xalign=0,
+            wrap=True,
+        )
+        footnote.add_css_class("scan-muted")
+        page.append(footnote)
+        self.stack.add_named(page, "scanning")
+
+    @staticmethod
+    def _set_accessible_label(widget, label):
+        try:
+            widget.update_property([Gtk.AccessibleProperty.LABEL], [label])
+        except (AttributeError, TypeError):
+            widget.set_tooltip_text(label)
+
     def _build_details_panel(self) -> Gtk.Widget:
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         panel.set_margin_start(16)
@@ -166,50 +308,176 @@ class Clearspace(Gtk.Application):
 
     def scan(self):
         self._scan_generation += 1
-        generation = self._scan_generation
         self._scan_started_at = time.monotonic()
+        self._scan_eta = EtaEstimator()
+        self._scan_largest_items = ()
+        self._scan_last_top_render = 0.0
+        self.stack.set_visible_child_name("scanning")
+        self.scan_subtitle.set_text(
+            f"{self.scan_root} · Everything stays on your computer and nothing is deleted."
+        )
+        self.scan_counter_label.set_text("0 / estimating folders")
+        self.scan_percent_label.set_text("")
+        self.scan_progress_bar.set_fraction(0)
+        self.scan_files_value.set_text("0")
+        self.scan_bytes_value.set_text("0.0 GiB")
+        self.scan_elapsed_value.set_text("0:00")
+        self.scan_eta_value.set_text("Calculating…")
+        self.scan_eta_value.set_visible(False)
+        self.scan_path_label.set_text(f"Now scanning: {self.scan_root}")
+        self._render_biggest_so_far()
+        self.scan_pause_button.set_label("Pause")
+        self.scan_pause_button.set_sensitive(True)
+        self.scan_cancel_button.set_sensitive(True)
+        self.scan_cancel_button.set_label("Cancel")
         self.selection = None
         self._workflow_busy = True
         self.scan_button.set_sensitive(False)
         self.review_button.set_sensitive(False)
         if hasattr(self, "tree_view"):
             self.tree_view.set_sensitive(False)
-        self.disk_label.set_text(f"Lendo {self.scan_root}…")
+        self.disk_label.set_text(f"Scanning {self.scan_root}…")
         self.scan_report_button.set_sensitive(False)
-        threading.Thread(target=self._scan_worker, args=(generation,), daemon=True).start()
+        self.partial_banner.set_visible(False)
+        self.scan_controller = ScanController()
 
-    def _scan_worker(self, generation):
-        import shutil
+        def scan_task(publish, cancel_event, pause_event):
+            import shutil
 
-        try:
-            scanner = None
-            if RustTreeScanner.available():
-                rust_scanner = RustTreeScanner(self.scan_root)
-                try:
-                    root = rust_scanner.scan_root()
-                    scanner = rust_scanner
-                except Exception as rust_error:
-                    rust_scanner.close()
-                    scanner = TreeScanner(self.scan_root)
-                    root = scanner.scan_root()
-                    scanner.report["rust_fallback"] = str(rust_error)
-            else:
-                scanner = TreeScanner(self.scan_root)
-                root = scanner.scan_root()
+            scanner = TreeScanner(self.scan_root)
+            root = scanner.scan_root(
+                progress=publish,
+                cancel_event=cancel_event,
+                pause_event=pause_event,
+            )
             evaluation = self.rule_engine.evaluate(root)
             inspection_roots = inspection_only_paths(self.scan_root)
             usage = shutil.disk_usage(self.scan_root)
-            error = None
-        except Exception as exc:
-            scanner = None
-            root = None
-            evaluation = None
-            inspection_roots = ()
-            usage = None
-            error = str(exc)
-        report = dict(scanner.report) if scanner else {}
-        GLib.idle_add(self._show_scan, generation, scanner, root, evaluation, usage,
-                      inspection_roots, report, error)
+            return scanner, root, evaluation, usage, inspection_roots
+
+        self.scan_controller.start(scan_task)
+        if self._scan_poll_source:
+            GLib.source_remove(self._scan_poll_source)
+        self._scan_poll_source = GLib.timeout_add(150, self._poll_scan)
+
+    def _poll_scan(self):
+        controller = self.scan_controller
+        event = controller.latest_snapshot()
+        self._update_scanning_view(event)
+        if event.state not in {ScanState.DONE, ScanState.CANCELLED, ScanState.ERROR}:
+            return GLib.SOURCE_CONTINUE
+        self._scan_poll_source = None
+        if controller.error:
+            self._finish_scan_error(controller.error)
+            return GLib.SOURCE_REMOVE
+        result = controller.result
+        if not result:
+            self._finish_scan_error(RuntimeError("scanner returned no result"))
+            return GLib.SOURCE_REMOVE
+        scanner, root, evaluation, usage, inspection_roots = result
+        report = dict(scanner.report)
+        report["partial"] = bool(
+            event.partial
+            or event.state is ScanState.CANCELLED
+            or report.get("errors", 0)
+        )
+        self._show_scan(
+            self._scan_generation,
+            scanner,
+            root,
+            evaluation,
+            usage,
+            inspection_roots,
+            report,
+            None,
+        )
+        if report["partial"]:
+            self.partial_banner.set_visible(True)
+        return GLib.SOURCE_REMOVE
+
+    def _update_scanning_view(self, event: ProgressEvent):
+        total = event.dirs_total_est
+        if total:
+            self.scan_counter_label.set_text(
+                f"{event.dirs_done:,} / ~{total:,} folders"
+            )
+        else:
+            self.scan_counter_label.set_text(f"{event.dirs_done:,} / estimating folders")
+        percent = progress_percent(event)
+        if percent is None:
+            self.scan_percent_label.set_text("")
+            self.scan_progress_bar.pulse()
+        else:
+            self.scan_percent_label.set_text(f"{percent}%")
+            self.scan_progress_bar.set_fraction(percent / 100)
+        self.scan_files_value.set_text(f"{event.files:,}")
+        self.scan_bytes_value.set_text(format_size_gib(event.bytes))
+        elapsed_ms = max(
+            event.elapsed_ms,
+            int((time.monotonic() - self._scan_started_at) * 1000),
+        )
+        self.scan_elapsed_value.set_text(format_elapsed(elapsed_ms))
+        self.scan_eta_value.set_visible(
+            bool((percent is not None and percent >= 5) or elapsed_ms >= 5_000)
+        )
+        eta = self._scan_eta.remaining_seconds(event)
+        if eta is None:
+            self.scan_eta_value.set_text("Calculating…")
+        else:
+            self.scan_eta_value.set_text(f"~{format_elapsed(eta * 1000)}")
+        path = event.current_path or str(self.scan_root)
+        self.scan_path_label.set_text(f"Now scanning: {path}")
+        self._scan_largest_items = tuple(getattr(event, "largest_items", ()))[:4]
+        now = time.monotonic()
+        if self._scan_largest_items and now - self._scan_last_top_render >= 1.0:
+            self._render_biggest_so_far()
+            self._scan_last_top_render = now
+        if event.state is ScanState.PAUSED:
+            self.scan_pause_button.set_label("Resume")
+        elif event.state is ScanState.RUNNING:
+            self.scan_pause_button.set_label("Pause")
+
+    def _render_biggest_so_far(self):
+        child = self.scan_biggest_box.get_first_child()
+        while child is not None:
+            self.scan_biggest_box.remove(child)
+            child = self.scan_biggest_box.get_first_child()
+        largest = self._scan_largest_items
+        maximum = max((size for _name, _path, size in largest), default=1)
+        for name, path, size in largest:
+            row = Gtk.Box(spacing=10)
+            label = Gtk.Label(label=name, xalign=0, hexpand=True, ellipsize=3)
+            label.set_tooltip_text(path)
+            row.append(label)
+            bar = Gtk.ProgressBar()
+            bar.set_size_request(110, 8)
+            bar.set_fraction(min(1.0, size / maximum))
+            self._set_accessible_label(bar, f"{name} size")
+            row.append(bar)
+            amount = Gtk.Label(label=format_bytes(size), xalign=1)
+            amount.add_css_class("scan-muted")
+            row.append(amount)
+            self.scan_biggest_box.append(row)
+
+    def _toggle_scan_pause(self, _button):
+        event = self.scan_controller.latest_snapshot()
+        if event.state is ScanState.PAUSED:
+            self.scan_controller.resume()
+        else:
+            self.scan_controller.pause()
+        self._update_scanning_view(self.scan_controller.latest_snapshot())
+
+    def _cancel_scan(self, _button):
+        self.scan_cancel_button.set_sensitive(False)
+        self.scan_cancel_button.set_label("Cancelling…")
+        self.scan_pause_button.set_sensitive(False)
+        self.scan_controller.cancel()
+
+    def _finish_scan_error(self, error):
+        self.disk_label.set_text(f"Could not read the tree: {error}")
+        self.scan_button.set_sensitive(True)
+        self._workflow_busy = False
+        self.stack.set_visible_child_name("results")
 
     def _show_scan(self, generation, scanner, root, evaluation, usage,
                    inspection_roots, report, error):
@@ -267,6 +535,7 @@ class Clearspace(Gtk.Application):
         self.scan_button.set_sensitive(True)
         self._workflow_busy = False
         self._refresh_selection_summary()
+        self.stack.set_visible_child_name("results")
         return GLib.SOURCE_REMOVE
 
     def _tree_mapped(self, _tree_view):

@@ -29,6 +29,7 @@ class ProgressEvent:
     current_path: str = ""
     state: ScanState = ScanState.RUNNING
     partial: bool = False
+    largest_items: tuple[tuple[str, str, int], ...] = ()
 
     def __post_init__(self) -> None:
         for name in ("dirs_done", "files", "bytes", "elapsed_ms"):
@@ -36,6 +37,16 @@ class ProgressEvent:
                 raise ValueError(f"{name} cannot be negative")
         if self.dirs_total_est is not None and self.dirs_total_est < 0:
             raise ValueError("dirs_total_est cannot be negative")
+        if len(self.largest_items) > 4:
+            raise ValueError("largest_items cannot contain more than four entries")
+        if any(
+            not isinstance(name, str)
+            or not isinstance(path, str)
+            or not isinstance(size, int)
+            or size < 0
+            for name, path, size in self.largest_items
+        ):
+            raise ValueError("largest_items entries must be (name, path, nonnegative size)")
 
 
 T = TypeVar("T")
@@ -218,11 +229,14 @@ class TopKTracker:
         if size_bytes < 0:
             raise ValueError("size_bytes cannot be negative")
         self._sequence += 1
-        item = (size_bytes, self._sequence, name, str(path))
         if len(self._heap) < self.limit:
-            heapq.heappush(self._heap, item)
+            heapq.heappush(
+                self._heap, (size_bytes, self._sequence, name, str(path))
+            )
         elif size_bytes > self._heap[0][0]:
-            heapq.heapreplace(self._heap, item)
+            heapq.heapreplace(
+                self._heap, (size_bytes, self._sequence, name, str(path))
+            )
 
     def snapshot(self) -> tuple[tuple[str, str, int], ...]:
         return tuple(

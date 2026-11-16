@@ -8,15 +8,18 @@ Clearspace is a local-first Linux disk cleanup app. It measures common disk cons
 python app.py
 ```
 
-Build the optional Rust scanner to use it in the app:
+Build the standalone Rust scanner:
 
 ```sh
 cargo build --release --manifest-path scanner/Cargo.toml
 ```
 
-The app uses that binary when present and falls back to the Python scanner if it
-cannot start or complete. Set `CLEARSPACE_SCAN_BIN` to use a binary at another
-location.
+The GTK scan screen currently uses the Python scanner so its folder-level live
+progress, pause, cancellation, and partial results have consistent behavior.
+The Rust binary currently implements JSONL protocol v1 and is not selected by
+that screen; the app can switch back after the binary supports the scanner
+agnostic progress/control contract in protocol v2. `CLEARSPACE_SCAN_BIN` still
+selects a binary for the headless Rust adapter.
 
 Na primeira abertura, a árvore começa em `/home`, para mostrar as pastas de
 usuários diretamente. Caminhos de cada usuário e dados de aplicações ativas
@@ -29,10 +32,16 @@ Clearspace stores a structured, local JSONL action history at `~/.local/share/cl
 ## Safety
 
 - Scanning is read-only and stays on the filesystem containing the scanned path.
-- The Rust scanner measures the tree in a background process, includes hidden files,
-  counts allocated disk blocks and hardlinks once, and never follows symlinks. The UI
-  queries each directory from SQLite only when it is expanded. The GTK-free Python
-  scanner remains as a fallback.
+- The standalone Rust scanner measures the tree in a background process, includes
+  hidden files, counts allocated disk blocks and hardlinks once, and never follows
+  symlinks. `RustTreeScanner` queries its SQLite database one directory at a time.
+- The GTK-free Python scanner powers the live scanning screen and supports its
+  cooperative controls and partial results.
+- The scanning screen reports folder progress with an estimated total, file/byte
+  counters, elapsed time, a smoothed ETA, and a bounded list of the four largest
+  observed entries. Pause and cancel are cooperative; cancellation keeps clearly
+  marked partial results. The UI polls a shared snapshot instead of receiving one
+  GTK callback per filesystem entry.
 - Scanner errors remain attached to their nodes. Each directory retains its 100 largest
   children plus an informational aggregate row for the rest. GTK row objects are created
   only when a directory is expanded. The scan report shows scan duration, GTK model-build

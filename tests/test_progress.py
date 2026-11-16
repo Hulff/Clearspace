@@ -58,6 +58,16 @@ def test_top_k_is_bounded_and_returns_largest_entries() -> None:
     assert [size for _, _, size in tracker.snapshot()] == [99_999, 99_998, 99_997, 99_996]
 
 
+def test_progress_event_caps_live_largest_items_at_four() -> None:
+    items = tuple((str(index), f"/root/{index}", index) for index in range(5))
+    try:
+        ProgressEvent(largest_items=items)
+    except ValueError as error:
+        assert "four" in str(error)
+    else:
+        raise AssertionError("ProgressEvent accepted an unbounded largest item list")
+
+
 def test_progress_throttle_caps_updates_and_allows_terminal_event() -> None:
     throttle = ProgressThrottle(0.15)
     assert throttle.should_publish(10.0)

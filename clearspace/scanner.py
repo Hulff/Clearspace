@@ -6,11 +6,14 @@ import logging
 import heapq
 import os
 import stat
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from .contracts import Node
+from .progress import ProgressEvent, ProgressThrottle, ScanState, TopKTracker
 
 logger = logging.getLogger(__name__)
 
@@ -30,10 +33,33 @@ class TreeScanner:
     _root_node: Node | None = field(default=None, init=False, repr=False)
     _directory_metadata_bytes: dict[Path, int] = field(default_factory=dict, init=False, repr=False)
     report: dict[str, int | float] = field(default_factory=dict, init=False)
+    top_items: TopKTracker = field(default_factory=TopKTracker, init=False, repr=False)
+    _progress: Callable[[ProgressEvent], None] | None = field(default=None, init=False, repr=False)
+    _cancel_event: threading.Event | None = field(default=None, init=False, repr=False)
+    _pause_event: threading.Event | None = field(default=None, init=False, repr=False)
+    _throttle: ProgressThrottle = field(default_factory=ProgressThrottle, init=False, repr=False)
+    _started_at: float = field(default=0.0, init=False, repr=False)
+    _dirs_done: int = field(default=0, init=False, repr=False)
 
-    def scan_root(self) -> Node:
+    def scan_root(
+        self,
+        *,
+        progress: Callable[[ProgressEvent], None] | None = None,
+        cancel_event: threading.Event | None = None,
+        pause_event: threading.Event | None = None,
+    ) -> Node:
         """Create the root node and measure every reachable directory."""
         started = time.monotonic()
+        self._started_at = started
+        self._progress = progress
+        self._cancel_event = cancel_event
+        self._pause_event = pause_event
+        self._dirs_done = 0
+        self._throttle = ProgressThrottle()
+        self.top_items = TopKTracker()
+        self._root_device = None
+        self._seen_inodes.clear()
+        self._directory_metadata_bytes.clear()
         self.report = {
             "directories": 0,
             "files": 0,
@@ -50,21 +76,77 @@ class TreeScanner:
                 info = current.lstat()
             except OSError as error:
                 self._log_error(current, error)
-                return Node(root_path, root_path.name, True, 0,
+                root = Node(root_path, root_path.name, True, 0,
                             error=self._error_text(error), children_loaded=True,
                             size_is_partial=True, selectable=False)
+                self.report["errors"] += 1
+                self._finish_report(root, started)
+                self._emit_progress(current, state=ScanState.ERROR, partial=True, force=True)
+                return root
             if stat.S_ISLNK(info.st_mode):
-                return Node(root_path, root_path.name, True, 0,
+                root = Node(root_path, root_path.name, True, 0,
                             error=f"symlink não seguido: {current}", children_loaded=True,
                             size_is_partial=True, selectable=False)
+                self._finish_report(root, started)
+                self._emit_progress(current, state=ScanState.ERROR, partial=True, force=True)
+                return root
         self.root_path = root_path
         root = self._node_for(self.root_path, is_root=True)
         root.selectable = False
         self._root_node = root
         self._expand_recursively(root)
+        self._finish_report(root, started)
+        if self._cancelled():
+            self._emit_progress(root.path, state=ScanState.CANCELLED,
+                                 partial=True, force=True)
+        elif root.error:
+            self._emit_progress(root.path, state=ScanState.ERROR,
+                                 partial=True, force=True)
+        else:
+            self._emit_progress(root.path, state=ScanState.DONE,
+                                 partial=root.size_is_partial, force=True)
+        return root
+
+    def _finish_report(self, root: Node, started: float) -> None:
         self.report["allocated_bytes"] = root.size_bytes
         self.report["elapsed_seconds"] = round(time.monotonic() - started, 3)
-        return root
+
+    def _emit_progress(
+        self,
+        path: Path,
+        *,
+        state: ScanState = ScanState.RUNNING,
+        partial: bool = False,
+        force: bool = False,
+    ) -> None:
+        if self._progress is None:
+            return
+        terminal = state in {ScanState.CANCELLED, ScanState.DONE, ScanState.ERROR}
+        if not force and not self._throttle.should_publish(terminal=terminal):
+            return
+        self._progress(ProgressEvent(
+            dirs_done=self._dirs_done,
+            dirs_total_est=int(self.report.get("directories", 0)),
+            files=int(self.report.get("files", 0)),
+            bytes=int(self.report.get("allocated_bytes", 0)),
+            elapsed_ms=int((time.monotonic() - self._started_at) * 1000),
+            current_path=str(path),
+            state=state,
+            partial=partial,
+            largest_items=self.top_items.snapshot(),
+        ))
+
+    def _checkpoint(self) -> bool:
+        if self._cancelled():
+            return False
+        if self._pause_event is not None:
+            while not self._pause_event.wait(timeout=0.1):
+                if self._cancelled():
+                    return False
+        return not self._cancelled()
+
+    def _cancelled(self) -> bool:
+        return self._cancel_event is not None and self._cancel_event.is_set()
 
     def _expand_recursively(self, node: Node) -> None:
         if not node.is_dir or node.children_loaded:
@@ -80,7 +162,11 @@ class TreeScanner:
             if child is None:
                 continue
             if child.is_dir:
-                self._expand_recursively(child)
+                if self._checkpoint():
+                    self._expand_recursively(child)
+                elif not child.children_loaded:
+                    child.size_is_partial = True
+                    node.size_is_partial = True
             if child.error or child.size_is_partial:
                 node.size_is_partial = True
             total_size += child.size_bytes
@@ -113,6 +199,12 @@ class TreeScanner:
                     aggregate_count=hidden_count,
                 ))
             node.size_bytes = self._directory_metadata_bytes.get(node.path, 0) + total_size
+            if self._progress is not None and node.path != self.root_path:
+                self.top_items.add(node.name, node.path, node.size_bytes)
+            self._dirs_done += 1
+            if self._cancelled():
+                node.size_is_partial = True
+            self._emit_progress(node.path, partial=node.size_is_partial)
         del pending
 
     def expand(self, node: Node) -> list[Node]:
@@ -121,15 +213,53 @@ class TreeScanner:
             return node.children
         directory_fd = None
         try:
+            if not self._checkpoint():
+                node.size_is_partial = True
+                node.children_loaded = True
+                return node.children
             directory_fd = self._open_directory_fd(node.path)
             with os.scandir(directory_fd) as iterator:
-                entries = []
-                for entry in iterator:
+                children: list[Node] = []
+                for index, entry in enumerate(iterator):
+                    # Checking control once per batch keeps pause/cancel responsive
+                    # without taking an Event lock for every filesystem entry.
+                    if index % 64 == 0 and not self._checkpoint():
+                        node.size_is_partial = True
+                        break
                     try:
                         info = entry.stat(follow_symlinks=False)
-                        entries.append((entry.name, info, None))
                     except OSError as error:
-                        entries.append((entry.name, None, error))
+                        self.report["errors"] += 1
+                        child = Node(
+                            node.path / entry.name,
+                            entry.name,
+                            False,
+                            0,
+                            error=self._error_text(error),
+                            size_is_partial=True,
+                            selectable=False,
+                        )
+                        children.append(child)
+                        self._log_error(child.path, error)
+                        self._emit_progress(child.path)
+                        continue
+
+                    path = node.path / entry.name
+                    if stat.S_ISLNK(info.st_mode):
+                        # Symlink targets are never inspected or traversed.
+                        self.report["symlinks_skipped"] += 1
+                        continue
+                    if info.st_dev != self._root_device:
+                        self.report["other_filesystems_skipped"] += 1
+                        continue
+
+                    size = self._allocated_size(info, path)
+                    child = Node(path, entry.name, stat.S_ISDIR(info.st_mode), size)
+                    self.report["directories" if child.is_dir else "files"] += 1
+                    if self._progress is not None and not child.is_dir:
+                        self.top_items.add(child.name, child.path, child.size_bytes)
+                    children.append(child)
+                    self._emit_progress(path)
         except OSError as error:
             self._set_error(node, error)
             node.children_loaded = True
@@ -138,35 +268,14 @@ class TreeScanner:
             if directory_fd is not None:
                 os.close(directory_fd)
 
-        children: list[Node] = []
-        for name, info, error in entries:
-            path = node.path / name
-            if error:
-                self.report["errors"] += 1
-                child = Node(path, name, False, 0, error=self._error_text(error),
-                             size_is_partial=True, selectable=False)
-                children.append(child)
-                self._log_error(path, error)
-                continue
-
-            if stat.S_ISLNK(info.st_mode):
-                # Symlink targets are never inspected and symlink nodes are not
-                # selectable for cleanup through the tree scanner.
-                self.report["symlinks_skipped"] += 1
-                continue
-            if info.st_dev != self._root_device:
-                self.report["other_filesystems_skipped"] += 1
-                continue
-
-            size = self._allocated_size(info, path)
-            child = Node(path, name, stat.S_ISDIR(info.st_mode), size)
-            self.report["directories" if child.is_dir else "files"] += 1
-            children.append(child)
-
+        if self._cancelled():
+            node.size_is_partial = True
         children.sort(key=lambda item: item.size_bytes, reverse=True)
         node.children = children
         node.children_loaded = True
         node.size_bytes = sum(child.size_bytes for child in children)
+        if self._cancelled():
+            node.size_is_partial = True
         return children
 
     def _open_directory_fd(self, path: Path) -> int:
@@ -215,13 +324,17 @@ class TreeScanner:
 
     def _allocated_size(self, info: os.stat_result, path: Path) -> int:
         if stat.S_ISDIR(info.st_mode):
-            return info.st_blocks * 512
+            size = info.st_blocks * 512
+            self.report["allocated_bytes"] += size
+            return size
         inode = (info.st_dev, info.st_ino)
         if info.st_nlink > 1:
             if inode in self._seen_inodes:
                 return 0
             self._seen_inodes.add(inode)
-        return info.st_blocks * 512
+        size = info.st_blocks * 512
+        self.report["allocated_bytes"] += size
+        return size
 
     def _set_error(self, node: Node, error: OSError) -> None:
         self.report["errors"] += 1

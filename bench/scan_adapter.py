@@ -74,20 +74,13 @@ def scan(root: Path) -> dict:
         finally:
             scanner.close()
     else:
-        class ProgressTreeScanner(TreeScanner):
-            def __init__(self, root_path: Path) -> None:
-                super().__init__(root_path)
-                self.first_progress_ms = None
+        def on_progress(_event) -> None:
+            nonlocal first_progress_ms
+            if first_progress_ms is None:
+                first_progress_ms = (time.perf_counter() - started) * 1000
 
-            def expand(self, node):
-                nonlocal first_progress_ms
-                children = super().expand(node)
-                if first_progress_ms is None:
-                    first_progress_ms = (time.perf_counter() - started) * 1000
-                return children
-
-        scanner = ProgressTreeScanner(root)
-        scanner.scan_root()
+        scanner = TreeScanner(root)
+        scanner.scan_root(progress=on_progress)
         report = scanner.report
 
     return {
