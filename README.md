@@ -22,6 +22,10 @@ Clearspace stores a structured, local JSONL action history at `~/.local/share/cl
 - A GTK-free rule engine classifies caches, builds, personal data, credentials, repositories,
   browser profiles, game data, and container volumes. It reports Git worktree changes and
   recommends installed native procedures; administrator procedures are copy-only.
+- File actions use a reviewed, one-item executor: Gio trash is the default, permanent
+  removal requires typing a confirmation phrase, and critical-risk paths are blocked.
+  Paths are revalidated against protected roots, active data, filesystem boundaries, and
+  symlinks before acting. Each attempt records its result and filesystem capacity in JSONL.
 - Cleanup runs one native command at a time, with a confirmation dialog showing the command and expected impact.
 - Data-bearing targets such as Trash, Docker volumes, browser profiles, model downloads, and project directories are inspection-only.
 - The app does not invoke a shell or request administrator privileges.

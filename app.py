@@ -104,12 +104,14 @@ class Clearspace(Gtk.Application):
             status.append("tamanho parcial")
         if item.read_error:
             status.append(f"Não foi possível ler: {item.read_error}")
+        if item.command:
+            status.append("Ação direta desativada; aguarda revisão item a item")
         status_text = f"\n{' · '.join(status)}" if status else ""
         detail = Gtk.Label(label=f"{size} · {item.risk}{status_text}\n{item.description}", xalign=0, wrap=True)
         detail.add_css_class("dim-label"); body.append(detail)
         if item.command:
-            button = Gtk.Button(label="Review cleanup")
-            button.connect("clicked", self.confirm_cleanup, item)
+            button = Gtk.Button(label="Review cleanup in tree")
+            button.set_sensitive(False)
             box.append(button)
         elif item.path and item.available:
             button = Gtk.Button(label="Open folder")
@@ -154,10 +156,11 @@ class Clearspace(Gtk.Application):
         dialog.show(self.window)
 
     def _cleanup_done(self, record):
-        if record["exit_code"] == 0:
+        if record.get("result") == "success" or record.get("exit_code") == 0:
             message = "Cleanup command completed successfully. Rescan to refresh measured sizes."
         else:
-            message = f"Cleanup command exited with status {record['exit_code']}. See recent history for details."
+            detail = record.get("failure_details", "See recent history for details.")
+            message = f"Ação não executada: {detail}"
         self.show_message("Cleanup finished", message)
         self.refresh_history()
         return GLib.SOURCE_REMOVE

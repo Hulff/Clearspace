@@ -229,25 +229,25 @@ class History:
 
 def execute_cleanup(candidate: Candidate, history: History,
                     on_finish: Callable[[dict], None]) -> None:
-    """Run a reviewed native cleanup command without shell interpolation."""
+    """Block the legacy bulk-command path in favor of reviewed item actions."""
     if candidate.command is None:
         raise ValueError("This candidate has no executable cleanup action")
     started = time.time()
-    before_result = directory_size(Path(candidate.path)) if candidate.path else None
-    before = before_result.bytes if before_result else candidate.size
-    try:
-        result = subprocess.run(candidate.command, capture_output=True, text=True, timeout=1800)
-        status, stdout, stderr = result.returncode, result.stdout[-4000:], result.stderr[-4000:]
-    except subprocess.TimeoutExpired as exc:
-        status, stdout, stderr = 124, "", str(exc)
-    after_result = directory_size(Path(candidate.path)) if candidate.path else None
-    after = after_result.bytes if after_result else None
     record = {
-        "schema_version": 1, "action_id": candidate.id, "title": candidate.title,
-        "timestamp_start": started, "timestamp_end": time.time(),
-        "command": list(candidate.command), "exit_code": status,
-        "before_bytes": before, "after_bytes": after,
-        "stdout": stdout, "stderr": stderr,
+        "schema_version": 2,
+        "action_id": candidate.id,
+        "title": candidate.title,
+        "path": candidate.path,
+        "size_bytes": candidate.size,
+        "action": "blocked_legacy_command",
+        "started_at": started,
+        "finished_at": time.time(),
+        "result": "failed",
+        "exit_code": 126,
+        "failure_details": (
+            "Execução direta de comandos foi desativada. Use a revisão item a item "
+            "com o executor seguro."
+        ),
     }
     history.append(record)
     on_finish(record)
