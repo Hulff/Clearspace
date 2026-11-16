@@ -1,0 +1,2 @@
+# Development and test dependency. GTK 4 bindings are provided by the OS.
+pytest

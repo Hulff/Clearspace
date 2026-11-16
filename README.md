@@ -5,10 +5,10 @@ Clearspace is a local-first Linux disk cleanup app. It measures common disk cons
 ## Run
 
 ```sh
-python3 app.py
+python app.py
 ```
 
-GTK 4 and its Python bindings (`python-gobject` / `python3-gobject`) are required. On Arch Linux, install them with `sudo pacman -S gtk4 python-gobject`.
+GTK 4 and its Python bindings (`python-gobject`) are required. On Arch Linux, install them with `sudo pacman -S gtk4 python-gobject`.
 
 Clearspace stores a structured, local JSONL action history at `~/.local/share/clearspace/history.jsonl`. It records action IDs, measured sizes, timestamps, command arguments, exit status, and output. It does not store file contents or send data over the network. This history format is intended to provide a future retrieval layer for personalized recommendations; no LLM or RAG functionality is included yet.
 
