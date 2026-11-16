@@ -114,8 +114,9 @@ The Python caller invokes `clearspace-scan` with an argument vector and
 untrusted. The scanner is read-only, does not follow symlinks, stays on the root
 filesystem, and does not use `sudo`, `pkexec`, or any other elevation. Root and
 excluded paths are explicit arguments/configuration, never machine-specific
-constants. The SQLite database is created in Clearspace's private state/cache
-directory and replaced atomically only after a successful finalization.
+constants. The SQLite database is created in a private temporary directory
+outside the scan root and published atomically only after a successful
+finalization. This keeps the database out of scans such as `/home` itself.
 
 The Rust implementation lives in the independent `scanner/` crate. It uses
 `jwalk` for parallel directory enumeration and `rusqlite` with bundled SQLite

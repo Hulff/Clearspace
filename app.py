@@ -27,6 +27,7 @@ from clearspace.executor import (
     discover_active_paths,
 )
 from clearspace.rules import RuleEngine, RuleEvaluation
+from clearspace.rust_scanner import RustTreeScanner
 from clearspace.scanner import TreeScanner
 
 
@@ -41,6 +42,7 @@ class TreeEntry(GObject.Object):
         self.children_store = Gio.ListStore.new(TreeEntry)
         self.children_model = None
         self.loading_children = False
+        self.scanner = None
 
 
 class Clearspace(Gtk.Application):
@@ -180,8 +182,20 @@ class Clearspace(Gtk.Application):
         import shutil
 
         try:
-            scanner = TreeScanner(self.scan_root)
-            root = scanner.scan_root()
+            scanner = None
+            if RustTreeScanner.available():
+                rust_scanner = RustTreeScanner(self.scan_root)
+                try:
+                    root = rust_scanner.scan_root()
+                    scanner = rust_scanner
+                except Exception as rust_error:
+                    rust_scanner.close()
+                    scanner = TreeScanner(self.scan_root)
+                    root = scanner.scan_root()
+                    scanner.report["rust_fallback"] = str(rust_error)
+            else:
+                scanner = TreeScanner(self.scan_root)
+                root = scanner.scan_root()
             evaluation = self.rule_engine.evaluate(root)
             inspection_roots = inspection_only_paths(self.scan_root)
             usage = shutil.disk_usage(self.scan_root)
@@ -296,6 +310,7 @@ class Clearspace(Gtk.Application):
         ):
             node.selectable = False
         entry = TreeEntry(node, evaluation)
+        entry.scanner = self.scanner
         if node.selectable:
             self.entries.setdefault(node.path, entry)
         return entry
@@ -326,6 +341,8 @@ class Clearspace(Gtk.Application):
 
     def _load_children_worker(self, entry: TreeEntry):
         try:
+            if entry.scanner is not None:
+                entry.scanner.expand(entry.node)
             children = tuple(entry.node.children)
             evaluated = tuple(
                 (node, None if node.aggregate_count else self.rule_engine.evaluate(node))

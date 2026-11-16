@@ -52,11 +52,11 @@ class TreeScanner:
                 self._log_error(current, error)
                 return Node(root_path, root_path.name, True, 0,
                             error=self._error_text(error), children_loaded=True,
-                            selectable=False)
+                            size_is_partial=True, selectable=False)
             if stat.S_ISLNK(info.st_mode):
                 return Node(root_path, root_path.name, True, 0,
                             error=f"symlink não seguido: {current}", children_loaded=True,
-                            selectable=False)
+                            size_is_partial=True, selectable=False)
         self.root_path = root_path
         root = self._node_for(self.root_path, is_root=True)
         root.selectable = False
@@ -81,6 +81,8 @@ class TreeScanner:
                 continue
             if child.is_dir:
                 self._expand_recursively(child)
+            if child.error or child.size_is_partial:
+                node.size_is_partial = True
             total_size += child.size_bytes
             if len(largest) < self.max_visible_children:
                 heapq.heappush(largest, (child.size_bytes, index, child))
@@ -142,7 +144,7 @@ class TreeScanner:
             if error:
                 self.report["errors"] += 1
                 child = Node(path, name, False, 0, error=self._error_text(error),
-                             selectable=False)
+                             size_is_partial=True, selectable=False)
                 children.append(child)
                 self._log_error(path, error)
                 continue
@@ -186,7 +188,9 @@ class TreeScanner:
         try:
             info = path.lstat()
         except OSError as error:
-            node = Node(path, path.name or str(path), True, 0, error=self._error_text(error))
+            node = Node(path, path.name or str(path), True, 0,
+                        error=self._error_text(error), size_is_partial=True,
+                        selectable=False)
             self._log_error(path, error)
             return node
 
@@ -222,7 +226,7 @@ class TreeScanner:
     def _set_error(self, node: Node, error: OSError) -> None:
         self.report["errors"] += 1
         node.error = self._error_text(error)
-        node.size_is_partial = node.size_bytes > 0
+        node.size_is_partial = True
         node.selectable = False
         self._log_error(node.path, error)
 

@@ -8,6 +8,16 @@ Clearspace is a local-first Linux disk cleanup app. It measures common disk cons
 python app.py
 ```
 
+Build the optional Rust scanner to use it in the app:
+
+```sh
+cargo build --release --manifest-path scanner/Cargo.toml
+```
+
+The app uses that binary when present and falls back to the Python scanner if it
+cannot start or complete. Set `CLEARSPACE_SCAN_BIN` to use a binary at another
+location.
+
 Na primeira abertura, a árvore começa em `/home`, para mostrar as pastas de
 usuários diretamente. Caminhos de cada usuário e dados de aplicações ativas
 continuam sujeitos às proteções do executor.
@@ -19,9 +29,10 @@ Clearspace stores a structured, local JSONL action history at `~/.local/share/cl
 ## Safety
 
 - Scanning is read-only and stays on the filesystem containing the scanned path.
-- The GTK-free tree scanner measures the complete tree in a background thread before
-  presenting it, includes hidden files, counts allocated disk blocks, counts hardlinked
-  files once, and never follows symlinks.
+- The Rust scanner measures the tree in a background process, includes hidden files,
+  counts allocated disk blocks and hardlinks once, and never follows symlinks. The UI
+  queries each directory from SQLite only when it is expanded. The GTK-free Python
+  scanner remains as a fallback.
 - Scanner errors remain attached to their nodes. Each directory retains its 100 largest
   children plus an informational aggregate row for the rest. GTK row objects are created
   only when a directory is expanded. The scan report shows scan duration, GTK model-build
