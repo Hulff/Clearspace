@@ -1,0 +1,12 @@
+[package]
+name = "clearspace-scan"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "clearspace-scan"
+path = "src/main.rs"
+
+[dependencies]
+jwalk = "0.8"
+rusqlite = { version = "0.38", features = ["bundled"] }

@@ -116,3 +116,10 @@ filesystem, and does not use `sudo`, `pkexec`, or any other elevation. Root and
 excluded paths are explicit arguments/configuration, never machine-specific
 constants. The SQLite database is created in Clearspace's private state/cache
 directory and replaced atomically only after a successful finalization.
+
+The Rust implementation lives in the independent `scanner/` crate. It uses
+`jwalk` for parallel directory enumeration and `rusqlite` with bundled SQLite
+for local database writes, avoiding a dependency on a system SQLite CLI or
+shared library. Build it with `cargo build --release --manifest-path
+scanner/Cargo.toml`; invoke it as
+`clearspace-scan <root> --db <database> [--exclude <path> ...]`.

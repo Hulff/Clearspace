@@ -14,6 +14,7 @@ env/
 .mypy_cache/
 .coverage
 htmlcov/
+scanner/target/
 
 # Local environment files
 .env
