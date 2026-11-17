@@ -12,6 +12,7 @@ from pathlib import Path
 import gi
 
 gi.require_version("Gtk", "4.0")
+gi.require_version("Gdk", "4.0")
 gi.require_version("Gio", "2.0")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
@@ -101,6 +102,10 @@ class Clearspace(Gtk.Application):
         self.local_assistant = LocalRuleAssistant()
         self.assistant_context = AssistantScanContext(0, 0, 0, 0)
         self.assistant_messages: list[tuple[str, str]] = []
+        self._responsive_poll_source = None
+        self._window_is_narrow: bool | None = None
+        self._auto_collapsed_for_width = False
+        self._responsive_toggle = False
 
     def do_activate(self):
         self.window = Gtk.ApplicationWindow(application=self, title="Clearspace")
@@ -149,21 +154,30 @@ class Clearspace(Gtk.Application):
         self.scan_report_button.set_sensitive(False)
         self.scan_report_button.connect("clicked", self.show_scan_report)
         scan_bar.append(self.scan_report_button)
+        self.assistant_panel_button = Gtk.ToggleButton(label="Hide assistant panel")
+        self.assistant_panel_button.set_active(True)
+        self.assistant_panel_button.connect(
+            "toggled", self._assistant_panel_toggled
+        )
+        self._set_accessible_label(
+            self.assistant_panel_button, "Show or hide assistant panel"
+        )
+        scan_bar.append(self.assistant_panel_button)
         outer.append(scan_bar)
         self.size_sorter = Gtk.CustomSorter.new(self._compare_entries)
 
-        panes = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True)
-        outer.append(panes)
+        self.panes = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True)
+        outer.append(self.panes)
 
         tree_scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
         tree_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        panes.set_start_child(tree_scroll)
+        self.panes.set_start_child(tree_scroll)
         self.tree_placeholder = Gtk.Label(label="Lendo /home…", xalign=0)
         tree_scroll.set_child(self.tree_placeholder)
 
         self.details = self._build_details_panel()
-        panes.set_end_child(self.details)
-        panes.set_position(900)
+        self.panes.set_end_child(self.details)
+        self.panes.set_position(900)
 
         footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         footer.add_css_class("results-footer")
@@ -186,6 +200,9 @@ class Clearspace(Gtk.Application):
 
         self.scan()
         self.window.present()
+        self._responsive_poll_source = GLib.timeout_add(
+            500, self._check_responsive_panel
+        )
 
     def _install_theme(self):
         css = """
@@ -200,6 +217,8 @@ class Clearspace(Gtk.Application):
         progressbar trough { min-height: 14px; border-radius: 8px; background: #34383a; }
         progressbar progress { min-height: 14px; border-radius: 8px; background: #5aa9ff; }
         button { min-height: 40px; }
+        checkbutton { min-width: 40px; min-height: 40px; }
+        entry { min-height: 40px; }
         .scan-current-path { font-family: monospace; color: #a9b0b3; }
         .scan-chip { background: #1c1f20; border-radius: 8px; padding: 8px 10px; }
         .badge { border-radius: 999px; padding: 4px 9px; font-weight: 600; }
@@ -363,6 +382,7 @@ class Clearspace(Gtk.Application):
         input_row = Gtk.Box(spacing=6)
         self.assistant_input = Gtk.Entry(hexpand=True)
         self.assistant_input.set_placeholder_text("Ask about this scan")
+        self._set_accessible_label(self.assistant_input, "Ask about this scan")
         self.assistant_input.connect("activate", self._assistant_input_activated)
         input_row.append(self.assistant_input)
         self.assistant_send_button = Gtk.Button(label="Send")
@@ -416,6 +436,47 @@ class Clearspace(Gtk.Application):
         collapsed = button.get_active()
         self.assistant_body.set_visible(not collapsed)
         button.set_label("Expand" if collapsed else "Collapse")
+
+    def _assistant_panel_toggled(self, button) -> None:
+        visible = button.get_active()
+        self._set_assistant_panel_visible(visible)
+        button.set_label("Hide assistant panel" if visible else "Show assistant panel")
+        if not self._responsive_toggle:
+            self._auto_collapsed_for_width = False
+
+    def _set_assistant_panel_visible(self, visible: bool) -> None:
+        if visible:
+            if self.panes.get_end_child() is None:
+                self.panes.set_end_child(self.details)
+                self.panes.set_position(max(1, self.window.get_width() - 360))
+        elif self.panes.get_end_child() is not None:
+            self.panes.set_end_child(None)
+
+    def _check_responsive_panel(self):
+        width = self.window.get_width()
+        if width <= 0:
+            return GLib.SOURCE_CONTINUE
+        narrow = width < 1000
+        if self._window_is_narrow is None:
+            self._window_is_narrow = narrow
+            if narrow and self.assistant_panel_button.get_active():
+                self._auto_collapsed_for_width = True
+                self._responsive_toggle = True
+                self.assistant_panel_button.set_active(False)
+                self._responsive_toggle = False
+        elif narrow != self._window_is_narrow:
+            self._window_is_narrow = narrow
+            if narrow and self.assistant_panel_button.get_active():
+                self._auto_collapsed_for_width = True
+                self._responsive_toggle = True
+                self.assistant_panel_button.set_active(False)
+                self._responsive_toggle = False
+            elif not narrow and self._auto_collapsed_for_width:
+                self._auto_collapsed_for_width = False
+                self._responsive_toggle = True
+                self.assistant_panel_button.set_active(True)
+                self._responsive_toggle = False
+        return GLib.SOURCE_CONTINUE
 
     def scan(self):
         self._scan_generation += 1
@@ -746,6 +807,11 @@ class Clearspace(Gtk.Application):
         self.tree_view.connect("map", self._tree_mapped)
         self.tree_view.set_show_row_separators(True)
         self.tree_view.set_show_column_separators(False)
+        self.tree_view.set_tab_behavior(Gtk.ListTabBehavior.CELL)
+        self._set_accessible_label(self.tree_view, "Disk usage file tree")
+        key_controller = Gtk.EventControllerKey()
+        key_controller.connect("key-pressed", self._tree_key_pressed)
+        self.tree_view.add_controller(key_controller)
         self.tree_view.append_column(self._checkbox_column())
         name_column = self._name_column()
         name_column.set_expand(True)
@@ -914,6 +980,7 @@ class Clearspace(Gtk.Application):
         tree_row = list_item.get_item()
         entry = tree_row.get_item()
         checkbox._clearspace_entry = entry
+        self._set_accessible_label(checkbox, f"Select {entry.node.name}")
         checkbox.set_sensitive(entry.node.selectable and not entry.loading)
         if entry.node.selectable:
             self.check_buttons.setdefault(entry.node.path, []).append(checkbox)
@@ -1016,6 +1083,10 @@ class Clearspace(Gtk.Application):
         max_size = max(1, max_size)
         fraction = min(1.0, entry.node.size_bytes / max_size)
         progress.set_fraction(fraction)
+        self._set_accessible_label(
+            progress,
+            f"{entry.node.name}: {fraction:.0%} of largest sibling",
+        )
 
     def _size_column(self):
         factory = Gtk.SignalListItemFactory.new()
@@ -1084,6 +1155,39 @@ class Clearspace(Gtk.Application):
     def _selected_item_changed(self, selection, _property):
         tree_row = selection.get_selected_item()
         self._show_details(tree_row.get_item() if tree_row else None)
+
+    def _tree_key_pressed(self, _controller, keyval, _keycode, _state):
+        tree_row = self.tree_selection.get_selected_item()
+        if tree_row is None:
+            return False
+        entry = tree_row.get_item()
+        if keyval == Gdk.KEY_space:
+            if not entry.node.selectable:
+                return True
+            current = self.selection.state(entry.node)
+            self.selection.set_checked(
+                entry.node, current is not SelectionState.CHECKED
+            )
+            self._refresh_all_checkboxes()
+            self._refresh_selection_summary()
+            return True
+        if keyval == Gdk.KEY_Right and entry.node.is_dir:
+            if tree_row.get_expanded():
+                child_row = tree_row.get_child_row(0)
+                if child_row is not None:
+                    self.tree_selection.set_selected(child_row.get_position())
+            else:
+                tree_row.set_expanded(True)
+            return True
+        if keyval == Gdk.KEY_Left:
+            if tree_row.get_expanded():
+                tree_row.set_expanded(False)
+                return True
+            parent_row = tree_row.get_parent()
+            if parent_row is not None:
+                self.tree_selection.set_selected(parent_row.get_position())
+                return True
+        return False
 
     def _show_details(self, entry: TreeEntry | None):
         self._detail_entry = entry

@@ -53,6 +53,9 @@ Clearspace stores a structured, local JSONL action history at `~/.local/share/cl
   Messages remain in memory for the current app session. Proposals can only highlight
   a node or open a review for items the user already selected; they never change cleanup
   checkboxes or execute actions. The assistant does not load a model or use the network.
+- The tree supports keyboard navigation (Space toggles cleanup selection, Left/Right
+  collapses/expands rows). The assistant/details panel collapses automatically below
+  1000 px and can be reopened with the toolbar toggle.
 - File actions use a reviewed, one-item executor: Gio trash is the default, permanent
   removal requires typing a confirmation phrase, and critical-risk paths are blocked.
   Paths are revalidated against protected roots, active data, filesystem boundaries, and
