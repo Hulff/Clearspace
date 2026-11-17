@@ -1,162 +1,81 @@
 # AGENTS.md — Clearspace
 
-Clearspace é um app GTK 4 em Python de limpeza de disco **local-first** para Linux. Ele mede consumidores comuns de disco, explica o que pode ser recuperado e só executa ferramentas nativas após revisão e confirmação do usuário.
+App GTK 4 (Python) de limpeza de disco local-first para Linux, com scanner em Rust. Mede consumidores de disco, explica o que pode ser recuperado e só executa ações após revisão e confirmação.
 
-Responda ao usuário em português do Brasil. Código, nomes de variáveis, commits e logs ficam em inglês.
+Responda em português do Brasil. Código, commits e logs em inglês. Seja conciso: não cole arquivos nem logs inteiros; use `-q`, `| tail -n 30`, `git diff --stat`.
 
-## Princípio central: o app é geral
+## Skills: invocação explícita
 
-Clearspace deve funcionar para **qualquer usuário, distribuição e conjunto de ferramentas**, não para uma máquina específica.
+Comece cada etapa nomeando a skill com `$nome`. Confira com `/skills` se está instalada; se não estiver, siga o passo equivalente da tabela e avise. O pedido do usuário e as invariantes abaixo têm prioridade sobre qualquer skill.
 
-- Bugs, medições e exemplos citados em conversas, issues ou documentos (como o playbook de cleanup) são **exemplos de uma máquina**, não requisitos. Não otimize o código para eles.
-- Nunca escreva no código nomes de usuário, caminhos absolutos de uma máquina, tamanhos observados ou nomes de containers/volumes/projetos de alguém.
-- Ao corrigir um bug, pergunte: **qual é a classe geral do problema?** Corrija a classe (ex.: "alvos de diretórios ocultos não aparecem", "erros de leitura somem"), não a instância (ex.: "falta o diretório X").
-- Não adicione um alvo só porque ele existe na máquina do desenvolvedor. Adicione quando ele for um consumidor de disco **comum** e tiver uma forma segura e documentada de ser tratado.
-- Testes usam **fixtures sintéticas** (`tmp_path`, ferramentas falsas), nunca dependem do conteúdo do home real.
+| Situação | Skill | Equivalente sem a skill |
+|---|---|---|
+| Bug, teste falhando, crash, travamento | `$systematic-debugging` | Reproduzir, instrumentar, causa raiz com arquivo:linha, corrigir a classe do problema, teste de regressão. Não edite antes da causa. |
+| Feature nova, mais de 2 arquivos, mudança de arquitetura | `$writing-plans` (antes, `$brainstorming` se o design for incerto) | Plano curto: escopo, arquivos, riscos, como testar. Espere OK se tocar executor, validador ou exclusão. |
+| Lógica pura nova (scanner, validador, executor, seleção, contrato) | `$test-driven-development` | Escreva o teste que falha primeiro. |
+| Antes de dizer "pronto" ou commitar | `$verification-before-completion` | Rode testes, lint e bench; mostre a saída; liste o que NÃO foi verificado. |
+| Mudança em executor, validador de caminhos ou exclusão | `$security-best-practices` (se instalada), além das invariantes | Revise contra a seção de segurança. |
+
+- Uma skill por etapa; não encadeie várias sem necessidade.
+- Não use `$subagent-driven-development`, `$dispatching-parallel-agents` nem `$yeet` sem pedido explícito.
+- Em tarefa de "investigar", não altere código: entregue causa raiz, evidência e diff proposto.
 
 ## Comandos
 
 ```sh
-python3 app.py                      # roda o app (requer GTK 4 + python-gobject)
-python3 -m pytest -q                # testes (se existir tests/)
-python3 -m ruff check . && python3 -m ruff format --check .   # lint, se configurado
-cargo test --workspace              # testes Rust (se existir crate)
-cargo clippy --workspace --all-targets -- -D warnings
-cargo fmt --all -- --check
+python3 app.py
+python3 -m pytest -q
+python3 -m bench.scan_bench              # só medições em --release; compara com du
+cargo test -q && cargo clippy --all-targets -- -D warnings && cargo fmt --check   # em scanner/
 ```
 
-Se um comando não existir no repo, não o invente: diga que falta e proponha adicioná-lo.
-A lógica do scanner deve ser testável **sem importar GTK** e sem display.
+Se um comando não existir, diga e proponha; não invente. A lógica é testável sem GTK nem display.
 
 ## Invariantes de segurança (nunca violar)
 
-1. **Scan é somente leitura** e permanece no filesystem do caminho escaneado (`st_dev`).
-2. **Nunca invocar shell**: `subprocess.run([...])` com lista de argumentos, `shell=False`. Sem `os.system`, sem f-string em comando.
-3. **Nunca pedir privilégios de administrador** (sem `sudo`, `pkexec`, `su`).
-4. **Uma ação destrutiva por vez**, sempre com diálogo mostrando comando exato, tamanho medido e impacto esperado.
-5. **Alvos com dados do usuário são somente inspeção**: lixeira, volumes de containers, perfis de navegador, modelos e datasets baixados, projetos, repositórios, bancos de dados, downloads.
-6. Nunca usar por padrão comandos amplos e irreversíveis: `rm -rf` em caches inteiros, prune de volumes, limpeza total de cache de pacotes.
-7. Canonicalizar (`Path.resolve()`) e validar qualquer caminho antes de agir; rejeitar `/`, a raiz do home, raízes do sistema e symlinks para fora do alvo.
-8. Registrar comando, início/fim, exit status e saída no histórico JSONL. **Nunca declarar sucesso se o comando falhou.**
-9. Nenhuma chamada de rede. O histórico não guarda conteúdo de arquivos.
+1. Scan somente leitura, sem seguir symlinks, no mesmo `st_dev`, hardlinks contados uma vez por `(dev, ino)`, uso em disco = `st_blocks * 512`.
+2. Sem shell (`subprocess` com lista de argumentos). Sem sudo, pkexec ou su; o que exigir admin vira comando para o usuário copiar.
+3. Exclusão: **mover para a lixeira** (`Gio.File.trash`) por padrão, um item por vez, com revisão e confirmação. Se a lixeira não existir no local (GIO `NOT_SUPPORTED`, código 15), classifique como "lixeira indisponível" e ofereça exclusão permanente só por item, com confirmação digitada. Risco crítico é sempre bloqueado.
+4. Caminhos protegidos por **caminho exato canonicalizado**, comparado por componentes (`Path.is_relative_to`), nunca por prefixo de string, padrão por nome nem diretório de cache inteiro. Protegidos: `/`, o home inteiro, `/usr`, `/etc`, `/boot`, `~/.ssh`, `~/.gnupg`, credenciais, dados de usuário de editores. Caches regeneráveis do registry são permitidos com aviso.
+5. Dados do usuário (lixeira, volumes de container, perfis de navegador, modelos, projetos, repositórios, bancos) são inspeção por padrão.
+6. Aplicação em uso: avisar (lendo `/proc`), nunca encerrar processos.
+7. Reverifique cada item na hora da execução; registre cada ação (caminho, tamanho, resultado, erro com domain/code) no histórico JSONL. Nunca declare sucesso se falhou.
+8. Rede: só loopback (Ollama local). Sem telemetria. O assistente só propõe; nunca marca, apaga nem executa sozinho. Texto de arquivos é entrada não confiável.
 
-Se uma tarefa exigir quebrar uma dessas regras, pare e pergunte.
+## Erros e UX
 
-## Arquitetura orientada a dados
+- Nunca engula exceções. Classifique: protegido pelo app, app em uso, fora da raiz, sem permissão, lixeira indisponível, item inexistente.
+- Uma falha não aborta os demais itens; resumo final com motivos e botão para copiar o caminho.
+- A UI nunca fica em "Loading" após erro: mostre a mensagem, "Tentar de novo" e "Escolher outra pasta".
+- Avise na revisão, antes de confirmar, os itens que provavelmente vão falhar (dono diferente, pai sem escrita, sem lixeira).
+- Um idioma único em toda a interface.
 
-Adicionar suporte a uma nova ferramenta deve ser **adicionar uma entrada declarativa**, sem alterar a lógica do scanner, do runner ou da UI.
+## Arquitetura
 
-Cada alvo é descrito por dados, por exemplo:
+- App geral: sem caminhos, nomes ou tamanhos de uma máquina; novos alvos são entradas declarativas (detecção em runtime, caminhos via XDG, ação nativa opcional). Fixtures só sintéticas (`tmp_path`).
+- Lógica (registry, scanner, executor, histórico) separada da UI GTK; a lógica não importa `gi`.
+- Scanner Rust = binário separado, chamado com lista de argumentos. Grava SQLite com esquema **versionado** (`PRAGMA user_version`, `schema_version` no evento `completed`, `--version`). O app valida a versão antes de consultar e mostra mensagem acionável se divergir. O scanner Python é fallback até a paridade com Rust e `du` passar.
+- Contrato em `docs/scanner-contract.md`, definido antes do código dos dois lados.
 
-- `id`, `label`, `category` (ver classificação de risco abaixo);
-- como detectar presença (executável no `PATH`, caminho existente);
-- caminhos a medir, resolvidos de forma portátil (`Path.home()`, `XDG_CACHE_HOME`, `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, com fallback para os padrões XDG);
-- ação nativa opcional, como lista de argumentos (ou nenhuma, se for só inspeção);
-- efeitos colaterais e se é regenerável, em texto para o diálogo.
+## Desempenho (máquina de 6 GB de RAM)
 
-Regras:
+- Nunca crie objeto de UI por nó. `create_func` é O(1), sem consulta ao banco. Carregue filhos ao expandir, em thread e em lote; `ORDER BY size DESC LIMIT 200` mais "N itens menores" pré-calculado.
+- Limite de nós vivos com descarte dos subtrees colapsados mais antigos. Seleção sem percorrer descendentes.
+- Mudança de desempenho exige medição antes e depois (tempo, pico de RAM) em `--release`. Sem números, não afirme melhora.
 
-- **Detecção em tempo de execução.** Ferramenta ausente não gera ação nem erro; o app não presume Arch, Docker, Node ou qualquer ferramenta específica.
-- **Gerenciadores de pacote por abstração** (pacman, apt, dnf, zypper, flatpak, etc.), cada um como provedor opcional. Nunca assumir uma distro.
-- **Descoberta genérica**: além do registry, o app pode listar os maiores diretórios dentro de `~/.cache`, `~/.local/share` e `~/.config` que não estão cobertos, sempre como **somente inspeção**.
-- Comandos de ferramentas devem ser conferidos contra a versão instalada antes de serem oferecidos.
+## Testes e pronto
 
-### Classificação de risco
-
-- **Regenerável / baixo risco:** caches de build e de download que a ferramenta recria.
-- **Risco moderado:** arquivos antigos de pacotes, imagens não usadas, índices de editor.
-- **Dados do usuário (somente inspeção):** tudo da invariante 5.
-- **Crítico do sistema (nunca tocar):** `/usr`, `/etc`, `/boot`, `/var/lib` desconhecido, dados de aplicações ativas.
-
-## Princípios de código
-
-- Separe **lógica** (registry, scanner, runner, histórico) da **UI GTK**. A lógica não importa `gi`.
-- Erros nunca são engolidos: `PermissionError`/`OSError` viram um estado visível ("não foi possível ler" com o motivo), nunca um `continue` silencioso. Tamanhos parciais são marcados como parciais.
-- Qualquer filtro (tamanho mínimo, profundidade, top N) deve ser explícito, configurável e contabilizar o que foi ocultado.
-- Scan roda fora da thread principal; atualizações de UI só via `GLib.idle_add`.
-- Type hints em funções públicas, `pathlib.Path`, `dataclass` para modelos.
-- Mudanças pequenas e focadas. Não refatore código não relacionado à tarefa.
-- Sem novas dependências sem justificar e pedir confirmação.
-
-## Desempenho e memória
-
-Assuma máquinas com **pouca RAM** (a máquina de referência tem 6 GB) e árvores com milhões de arquivos.
-
-- **Nunca crie um objeto de UI por nó da árvore.** Crie linhas GTK só para nós visíveis/expandidos (carregamento preguiçoso) e limite filhos por pasta (top N por tamanho, com um nó agregado "N itens menores").
-- Estruturas de dados compactas por nó (`__slots__`/`dataclass(slots=True)` em Python; índices `u32` e nomes sem duplicação em Rust). Não mantenha a árvore inteira em memória: consulte sob demanda.
-- Toda mudança de desempenho vem com **medição antes/depois** (duração do scan, pico de RAM, tempo até a UI aparecer). Não afirme "ficou mais rápido" sem números.
-- Compare o scan com `du -sx` como piso de referência. Se o gargalo for a UI, não otimize o scanner.
-
-## Rust
-
-Partes pesadas (scanner e, se os números justificarem, mais) migram para Rust **de forma incremental**. A UI GTK continua em Python até haver medição que justifique reescrevê-la.
-
-- **Fronteira por processo:** o scanner é um binário separado (`clearspace-scan`) chamado pelo Python com **lista de argumentos, sem shell**. Ele grava o resultado em **SQLite** (nós com pai, nome, tipo, uso em disco, mtime, erro, parcial; índice por `(parent_id, size DESC)`) e emite progresso em JSONL no stdout. O Python consulta os filhos sob demanda.
-- **Contrato primeiro:** o esquema SQLite e o protocolo de progresso ficam documentados em `docs/scanner-contract.md` e são definidos **antes** do código dos dois lados.
-- **As invariantes de segurança valem integralmente em Rust:** somente leitura, sem seguir symlinks, mesmo `st_dev`, hardlinks contados uma vez por `(dev, ino)`, erros viram estado visível (nunca engolidos), sem sudo, sem rede. Uso em disco é `st_blocks * 512`, como o `du`.
-- **Código:** `cargo fmt` e `cargo clippy -D warnings` limpos; sem `unwrap()`/`expect()` em caminhos de dados do usuário (use `Result` com contexto); `unsafe` só com justificativa em comentário; dependências mínimas e justificadas (por exemplo `ignore` ou `jwalk` para o percorrimento paralelo, `rusqlite` para o banco).
-- **Paridade:** enquanto o scanner Rust não passar nos testes de paridade contra o Python (mesma árvore sintética, mesmos tamanhos, hardlinks e erros) e contra o `du`, o scanner Python permanece como fallback.
-- **Sem caminhos nem nomes de uma máquina** em nenhum crate ou teste; fixtures sintéticas em diretórios temporários.
-
-## Fluxo de trabalho
-
-1. **Entender**: leia os arquivos relevantes antes de editar. Em bugs, encontre a causa raiz com evidência (arquivo:linha, saída de script) e identifique a **classe geral** do problema.
-2. **Planejar**: para tarefas com mais de 2 arquivos, escreva um plano curto (objetivo, arquivos, riscos, como testar).
-3. **Implementar** em passos pequenos, rodando testes a cada passo.
-4. **Verificar**: testes e lint; para scanner, um script headless sobre uma árvore sintética.
-5. **Reportar**: o que mudou, evidência, riscos restantes e o que **não** foi testado.
-
-Quando a tarefa for "investigar", **não altere código**: entregue causa raiz, evidência e diff proposto.
+- Testes sem GTK em `tmp_path`: hardlinks, symlinks, permissão negada, dotfiles, árvore grande; paridade Python × Rust × `du`; teste de contrato rodando as consultas EXATAS da UI contra o banco do scanner real; caminhos protegidos; erros classificados.
+- Todo bug ganha teste de regressão da classe do problema.
+- Pronto quando: invariantes preservadas, testes e lint passam (ou a ausência foi declarada), nenhum erro engolido, README e contrato atualizados, resumo com evidência e o que não foi verificado (diálogos GTK).
 
 ## Paralelismo
 
-Use subagentes, tarefas paralelas ou git worktrees, conforme o ambiente permitir, onde isso economiza tempo sem gerar conflitos.
-
-**Paralelize (leitura, independente):**
-- Explorar partes diferentes do código (registry, scanner, UI, runner, histórico).
-- Rodar testes, lint e scripts headless.
-- Pesquisar o comportamento de ferramentas externas.
-- Revisar o diff por ângulos separados (segurança, erros engolidos, generalidade, thread/UI).
-
-**Não paralelize (escrita no mesmo lugar):**
-- Dois agentes editando o mesmo arquivo. Se o código for monolítico, **um único agente escreve por vez**.
-- Mudanças que dependem do resultado de outra.
-
-**Escritas paralelas:**
-1. Defina primeiro o **contrato** entre as partes (assinaturas, dataclasses, formato do registry e do JSONL).
-2. Cada agente é dono de arquivos **disjuntos**, de preferência em worktree/branch própria.
-3. Cada agente entrega: arquivos alterados, testes passando e riscos. Um integrador mescla e roda a suíte completa.
-4. Nunca rodar em paralelo comandos destrutivos ou que alterem o ambiente do usuário.
-5. Se o ganho for pequeno ou a divisão ambígua, faça em série.
-
-Frentes típicas: registry/classificação, scanner (Python), scanner (Rust), runner/histórico, UI, testes de paridade. (Use os nomes de módulos reais do repo.) O scanner Rust e a correção da UI em Python são independentes **depois** que o contrato do SQLite estiver definido; só o integrador mexe nos arquivos de integração entre os dois.
-
-## Testes
-
-- Árvores temporárias: arquivos e diretórios ocultos, symlinks (não seguidos), permissão negada, outro `st_dev` simulado, caminhos inexistentes.
-- Runner com comandos falsos: `shell=False`, argumentos em lista, exit status de falha registrado.
-- Alvos somente inspeção **nunca** geram ação destrutiva.
-- Registry: toda entrada tem categoria, e nenhuma contém caminho absoluto fixo de usuário.
-- Todo bug corrigido ganha um teste de regressão **para a classe do problema**, não só para o caso observado.
-- Rust: testes com árvores temporárias (hardlinks, symlinks, permissão negada, dotfiles, árvore grande) e **testes de paridade** Python × Rust × `du` sobre a mesma árvore sintética.
-
-## Definição de pronto
-
-- [ ] Invariantes de segurança preservados.
-- [ ] Mudanças de desempenho com medição antes/depois (tempo, pico de RAM).
-- [ ] Rust: `cargo test`, `cargo clippy -D warnings` e `cargo fmt --check` passam (ou a ausência foi declarada).
-- [ ] Solução geral, sem nomes ou caminhos de uma máquina específica.
-- [ ] Testes e lint passam (ou a ausência deles foi declarada).
-- [ ] Nenhum erro engolido; itens ilegíveis aparecem na UI.
-- [ ] README atualizado se o comportamento visível mudou.
-- [ ] Resumo final com evidência, riscos e o que não foi verificado.
+Só em leitura (explorar, testes, revisão). Em escrita, um agente por arquivo, com contrato definido antes e um integrador no fim. Nunca comandos destrutivos em paralelo.
 
 ## Não faça
 
-- Não aplique correções quando a tarefa pedir só investigação.
-- Não codifique caminhos, usuários, tamanhos ou nomes da máquina do desenvolvedor.
-- Não apague, mova ou modifique arquivos fora do repositório durante testes; use `tmp_path`.
-- Não adicione LLM, RAG ou telemetria (o histórico JSONL é só base para o futuro).
-- Não reescreva a UI em Rust, nem remova o scanner Python, antes de a medição e os testes de paridade justificarem.
-- Não monte widgets ou objetos de UI para a árvore inteira.
-- Não afirme que algo funciona sem ter executado.
+- Não relaxe invariantes, não crie exceções soltas ao validador, não use sudo.
+- Não adicione dependências, LLM, RAG ou telemetria sem pedir.
+- Não reescreva a UI em Rust nem remova o scanner Python sem medição e paridade.
+- Não afirme que funciona sem ter executado.

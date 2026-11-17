@@ -1414,6 +1414,7 @@ class Clearspace(Gtk.Application):
         node: Node,
         evaluation: RuleEvaluation | None,
         *,
+        loading: bool = False,
         parent_entry: TreeEntry | None = None,
     ) -> TreeEntry:
         if any(
@@ -1423,7 +1424,7 @@ class Clearspace(Gtk.Application):
             for protected in self.inspection_only_roots
         ):
             node.selectable = False
-        entry = TreeEntry(node, evaluation, parent_entry=parent_entry)
+        entry = TreeEntry(node, evaluation, loading=loading, parent_entry=parent_entry)
         entry.scanner = self.scanner
         self._live_entry_count += 1
         if node.selectable and not node.aggregate_count and not node.is_more_row:
