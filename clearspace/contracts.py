@@ -30,6 +30,14 @@ class Node:
     size_is_partial: bool = False
     selectable: bool = True
     aggregate_count: int = 0
+    node_id: int | None = None
+    parent_id: int | None = None
+    child_count: int = 0
+    child_size_bytes: int = 0
+    loaded_child_count: int = 0
+    loaded_child_size_bytes: int = 0
+    is_more_row: bool = False
+    more_offset: int = 0
 
     def __post_init__(self) -> None:
         if self.size_bytes < 0:
@@ -40,34 +48,45 @@ class Node:
 
 @dataclass
 class SelectionModel:
-    """Tracks checked nodes and exposes minimal paths and estimated size."""
+    """Track only explicit selected paths; never walk filesystem descendants."""
 
     roots: list[Node]
     _checked: set[Path] = field(default_factory=set, repr=False)
+    _sizes: dict[Path, int] = field(default_factory=dict, repr=False)
 
     def set_checked(self, node: Node, checked: bool) -> None:
         """Set a node's selection, clearing descendants when checking it."""
         if not node.selectable:
             return
         if checked:
+            if any(_is_at_or_below(node.path, path) for path in self._checked):
+                return
             self._checked = {
                 path for path in self._checked
                 if not _is_at_or_below(path, node.path)
             }
             self._checked.add(node.path)
-        else:
-            self._checked = {
-                path for path in self._checked
+            self._sizes = {
+                path: size for path, size in self._sizes.items()
                 if not _is_at_or_below(path, node.path)
             }
+            self._sizes[node.path] = node.size_bytes
+        else:
+            ancestors = [path for path in self._checked if _is_at_or_below(node.path, path)]
+            if ancestors:
+                for path in ancestors:
+                    self._checked.discard(path)
+                    self._sizes.pop(path, None)
+            else:
+                self._checked.discard(node.path)
+                self._sizes.pop(node.path, None)
 
     def state(self, node: Node) -> SelectionState:
-        if node.path in self._checked:
+        if any(_is_at_or_below(node.path, path) for path in self._checked):
             return SelectionState.CHECKED
-        descendants = [path for path in self._checked if _is_at_or_below(path, node.path)]
-        if not descendants:
-            return SelectionState.UNCHECKED
-        return SelectionState.PARTIAL
+        if any(_is_at_or_below(path, node.path) for path in self._checked):
+            return SelectionState.PARTIAL
+        return SelectionState.UNCHECKED
 
     @property
     def selected_paths(self) -> tuple[Path, ...]:
@@ -81,11 +100,7 @@ class SelectionModel:
 
     @property
     def estimated_size_bytes(self) -> int:
-        nodes = {
-            node.path: node for root in self.roots for node in _walk(root)
-            if node.selectable
-        }
-        return sum(nodes[path].size_bytes for path in self.selected_paths if path in nodes)
+        return sum(self._sizes.get(path, 0) for path in self.selected_paths)
 
 
 def _is_at_or_below(path: Path, parent: Path) -> bool:
@@ -94,12 +109,6 @@ def _is_at_or_below(path: Path, parent: Path) -> bool:
         return True
     except ValueError:
         return False
-
-
-def _walk(node: Node):
-    yield node
-    for child in node.children:
-        yield from _walk(child)
 
 
 class Risk(StrEnum):

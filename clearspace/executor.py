@@ -55,6 +55,7 @@ class ReviewedItem:
     size_bytes: int
     risk: Risk
     warnings: tuple[str, ...] = ()
+    trash_supported: bool | None = None
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,8 @@ def build_review(
     risks: dict[Path, Risk] | None = None,
     warnings: dict[Path, tuple[str, ...]] | None = None,
     active_paths: tuple[Path, ...] | None = None,
+    trash_support: Callable[[Path], bool | None] | None = None,
+    home_device: int | None = None,
 ) -> CleanupReview:
     """Validate and measure a minimal, reviewed set of paths under a root."""
     root = _canonical_root(allowed_root)
@@ -93,6 +96,8 @@ def build_review(
         active_paths = discover_active_paths(root)
     risks = risks or {}
     warnings = warnings or {}
+    if home_device is None:
+        home_device = Path.home().stat().st_dev
     validated: list[tuple[Path, Path, os.stat_result]] = []
     for raw_path in paths:
         path, info = _validate_path(raw_path, root, active_paths)
@@ -105,8 +110,14 @@ def build_review(
         size = _tree_allocated_size(path, root, info.st_dev, seen_inodes)
         selected_raw = next(raw for raw, canonical, _ in validated if canonical == raw_path)
         risk = risks.get(selected_raw, risks.get(raw_path, Risk.MODERATE))
-        item_warnings = warnings.get(selected_raw, warnings.get(raw_path, ()))
-        items.append(ReviewedItem(path, size, risk, tuple(item_warnings)))
+        item_warnings = list(warnings.get(selected_raw, warnings.get(raw_path, ())))
+        item_warnings.extend(_permission_warnings(path, info))
+        supported = trash_support(path) if trash_support is not None else None
+        if info.st_dev != home_device:
+            supported = False
+        if info.st_dev != home_device or supported is False:
+            item_warnings.append("Este local não tem lixeira (partição diferente do home)")
+        items.append(ReviewedItem(path, size, risk, tuple(dict.fromkeys(item_warnings)), supported))
     if not items:
         raise ValueError("Selecione ao menos um item para revisar")
     max_risk = max((item.risk for item in items), key=_risk_rank)
@@ -222,6 +233,12 @@ class ItemExecutor:
         started_at = time.time()
         before_df = _disk_usage_record(review.allowed_root)
         failure: str | None = None
+        error_kind: str | None = None
+        exception_type: str | None = None
+        exception_class: str | None = None
+        error_errno: int | None = None
+        glib_domain: str | None = None
+        glib_code: int | None = None
         size_at_execution = item.size_bytes
 
         try:
@@ -241,8 +258,8 @@ class ItemExecutor:
                     raise UnsafePathError(
                         f'Digite exatamente "{PERMANENT_CONFIRMATION}" para confirmar'
                     )
-                if item.risk is Risk.CRITICAL:
-                    raise UnsafePathError("Exclusão permanente bloqueada para risco crítico")
+            if item.risk is Risk.CRITICAL:
+                raise UnsafePathError("Exclusão permanente bloqueada para risco crítico")
 
             checked_path, info = _validate_path(item.path, review.allowed_root, active_paths)
             size_at_execution = _tree_allocated_size(checked_path, review.allowed_root, info.st_dev)
@@ -256,6 +273,12 @@ class ItemExecutor:
                 raise ValueError(f"Ação desconhecida: {action}")
         except Exception as error:
             failure = str(error)
+            error_kind = _error_kind(error)
+            exception_type = type(error).__name__
+            exception_class = f"{type(error).__module__}.{type(error).__qualname__}"
+            error_errno = getattr(error, "errno", None)
+            glib_domain = getattr(error, "domain", None)
+            glib_code = getattr(error, "code", None)
             logger.warning("File action %s failed for %s: %s", action, path, error)
 
         after_df = _disk_usage_record(review.allowed_root)
@@ -269,6 +292,13 @@ class ItemExecutor:
             "finished_at": finished_at,
             "result": "failed" if failure else "success",
             "failure_details": failure,
+            "failure_kind": error_kind,
+            "failure_message": _failure_message(error_kind, failure),
+            "exception_type": exception_type,
+            "exception_class": exception_class,
+            "errno": error_errno,
+            "glib_domain": glib_domain,
+            "glib_code": glib_code,
             "filesystem_before": before_df,
             "filesystem_after": after_df,
         }
@@ -284,6 +314,24 @@ class ItemExecutor:
             failure = record["failure_details"]
             logger.exception("Could not append action to JSONL history")
         return ItemResult(item.path, action, failure is None, record)
+
+    def record_skip(self, review: CleanupReview, item: ReviewedItem) -> ItemResult:
+        """Record an explicitly skipped item in the reviewed plan."""
+        now = time.time()
+        record = {
+            "schema_version": 1,
+            "path": str(item.path),
+            "size_bytes": item.size_bytes,
+            "action": FileAction.TRASH.value,
+            "started_at": now,
+            "finished_at": now,
+            "result": "failed",
+            "failure_kind": "trash_unavailable",
+            "failure_details": "Item ignorado por escolha do usuário; nenhum fallback foi executado.",
+            "failure_message": "Lixeira indisponível neste filesystem; item ignorado.",
+        }
+        self.history.append(record)
+        return ItemResult(item.path, FileAction.TRASH, False, record)
 
 
 def _minimal_paths(paths: list[Path] | tuple[Path, ...]) -> tuple[Path, ...]:
@@ -332,6 +380,8 @@ def _validate_path(
         try:
             info = current.lstat()
         except OSError as error:
+            if isinstance(error, (PermissionError, FileNotFoundError)):
+                raise
             raise UnsafePathError(f"Caminho não pode ser validado: {error}") from error
         if stat.S_ISLNK(info.st_mode):
             raise UnsafePathError(f"Symlink bloqueado: {current}")
@@ -341,6 +391,8 @@ def _validate_path(
         canonical.relative_to(root)
         info = canonical.lstat()
     except (OSError, ValueError) as error:
+        if isinstance(error, (PermissionError, FileNotFoundError)):
+            raise
         raise UnsafePathError(f"Caminho escapou da raiz ou não existe: {candidate}") from error
     if _is_protected(canonical, root, active_paths):
         raise UnsafePathError(f"Caminho protegido: {canonical}")
@@ -361,12 +413,16 @@ def _validate_nested_links(path: Path, root: Path, root_device: int,
         with os.scandir(path) as entries:
             children = list(entries)
     except OSError as error:
+        if isinstance(error, (PermissionError, FileNotFoundError)):
+            raise
         raise UnsafePathError(f"Não foi possível revisar o diretório {path}: {error}") from error
     for entry in children:
         child = Path(entry.path)
         try:
             info = entry.stat(follow_symlinks=False)
         except OSError as error:
+            if isinstance(error, (PermissionError, FileNotFoundError)):
+                raise
             raise UnsafePathError(f"Não foi possível revisar {child}: {error}") from error
         if info.st_dev != root_device:
             raise UnsafePathError(f"Subdiretório em outro filesystem: {child}")
@@ -400,6 +456,8 @@ def _tree_allocated_size(
         try:
             info = current.lstat()
         except OSError as error:
+            if isinstance(error, (PermissionError, FileNotFoundError)):
+                raise
             raise UnsafePathError(f"Não foi possível medir {current}: {error}") from error
         if info.st_dev != root_device:
             raise UnsafePathError(f"Filesystem diferente durante medição: {current}")
@@ -411,6 +469,8 @@ def _tree_allocated_size(
                 with os.scandir(current) as entries:
                     pending.extend(Path(entry.path) for entry in entries)
             except OSError as error:
+                if isinstance(error, (PermissionError, FileNotFoundError)):
+                    raise
                 raise UnsafePathError(f"Não foi possível medir {current}: {error}") from error
             continue
         if not stat.S_ISREG(info.st_mode):
@@ -498,6 +558,80 @@ def _is_protected(path: Path, root: Path, active_paths: tuple[Path, ...]) -> boo
     except ValueError:
         return True
     return False
+
+
+def _permission_warnings(path: Path, info: os.stat_result) -> tuple[str, ...]:
+    warnings = []
+    if info.st_uid != os.getuid():
+        warnings.append(
+            f"O item pertence ao UID {info.st_uid}, diferente do usuário atual; "
+            "o sistema pode negar a operação. Procedimento recomendado: solicite ao dono "
+            "ou administrador que ajuste a propriedade/permissões fora do Clearspace."
+        )
+    try:
+        parent_info = path.parent.stat()
+        writable = bool(parent_info.st_mode & 0o222) and os.access(
+            path.parent, os.W_OK | os.X_OK
+        )
+    except OSError:
+        writable = False
+    if not writable:
+        warnings.append(
+            "A pasta pai não permite escrita ao usuário atual; a ação provavelmente falhará. "
+            "Ajuste as permissões da pasta pelo gerenciador de arquivos ou peça ao dono "
+            "para fazê-lo. Clearspace não executa comandos privilegiados."
+        )
+    return tuple(warnings)
+
+
+def _error_kind(error: Exception) -> str:
+    if isinstance(error, UnsafePathError):
+        return "app_protected"
+    if isinstance(error, FileNotFoundError):
+        return "missing"
+    if isinstance(error, PermissionError):
+        return "filesystem_permission"
+    if isinstance(error, OSError) and error.errno in {errno.EACCES, errno.EPERM}:
+        return "filesystem_permission"
+    if getattr(error, "domain", None) == "g-io-error-quark":
+        code = getattr(error, "code", None)
+        if code == 14:  # G_IO_ERROR_PERMISSION_DENIED
+            return "filesystem_permission"
+        if code == 1:  # G_IO_ERROR_NOT_FOUND
+            return "missing"
+        if code in {15, 16}:  # G_IO_ERROR_NOT_SUPPORTED / NOT_MOUNTED
+            return "trash_unavailable"
+    return "operation_failed"
+
+
+def _failure_message(kind: str | None, details: str | None) -> str | None:
+    messages = {
+        "app_protected": "Item bloqueado pelas proteções do Clearspace.",
+        "filesystem_permission": "Sem permissão do sistema de arquivos.",
+        "trash_unavailable": "A lixeira não está disponível neste filesystem.",
+        "missing": "O item não existe mais.",
+    }
+    if details is None:
+        return None
+    return f"{messages.get(kind, 'A operação falhou.')} {details}"
+
+
+def gio_trash_supported(path: Path) -> bool | None:
+    """Return Gio's can-trash attribute, or None if the query is unavailable."""
+    try:
+        import gi
+        gi.require_version("Gio", "2.0")
+        from gi.repository import Gio
+        file = Gio.File.new_for_path(str(path))
+        info = file.query_info(
+            Gio.FILE_ATTRIBUTE_ACCESS_CAN_TRASH,
+            Gio.FileQueryInfoFlags.NONE,
+            None,
+        )
+        return info.get_attribute_boolean(Gio.FILE_ATTRIBUTE_ACCESS_CAN_TRASH)
+    except Exception as error:
+        logger.info("Could not query trash support for %s: %s", path, error)
+        return None
 
 
 def _disk_usage_record(path: Path) -> dict | None:

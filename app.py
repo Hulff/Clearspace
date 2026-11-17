@@ -9,6 +9,7 @@ import resource
 import stat
 import threading
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 import gi
@@ -48,6 +49,7 @@ from clearspace.executor import (
     ReviewedItem,
     build_review,
     discover_active_paths,
+    gio_trash_supported,
 )
 from clearspace.locations import (
     ScanOptions,
@@ -55,11 +57,23 @@ from clearspace.locations import (
     canonical_directory,
     format_age,
     resolve_xdg_locations,
-    scanner_arguments,
     validate_scan_root,
 )
 from clearspace.rules import RuleEngine, RuleEvaluation
-from clearspace.scanner import TreeScanner
+from clearspace.rust_scanner import RustScannerError, RustTreeScanner
+
+
+def _bounded_setting(name: str, default: int, minimum: int) -> int:
+    try:
+        return max(minimum, int(os.environ.get(name, str(default))))
+    except ValueError:
+        return default
+
+
+TREE_PAGE_SIZE = _bounded_setting("CLEARSPACE_TREE_PAGE_SIZE", 200, 1)
+TREE_NODE_CAP = _bounded_setting("CLEARSPACE_MAX_TREE_NODES", 20_000, 256)
+TREE_EXPANDED_CACHE = _bounded_setting("CLEARSPACE_TREE_CACHE_FOLDERS", 32, 1)
+TREE_EVICT_DELAY_MS = _bounded_setting("CLEARSPACE_TREE_EVICT_DELAY_MS", 1200, 0)
 
 
 class TreeEntry(GObject.Object):
@@ -82,6 +96,9 @@ class TreeEntry(GObject.Object):
         self.children_model = None
         self.loading_children = False
         self.scanner = None
+        self.bound_rows = set()
+        self.load_generation = 0
+        self.is_expanded = False
 
 
 class Clearspace(Gtk.Application):
@@ -93,7 +110,7 @@ class Clearspace(Gtk.Application):
         self.scan_options = ScanOptions()
         self.chosen_scan_path = self.scan_root
         self.browser_path = self.scan_root
-        self.scanner: TreeScanner | None = None
+        self.scanner: RustTreeScanner | None = None
         self.root_node: Node | None = None
         self.root_entry: TreeEntry | None = None
         self.selection: SelectionModel | None = None
@@ -104,8 +121,8 @@ class Clearspace(Gtk.Application):
         self._review: CleanupReview | None = None
         self._review_action: FileAction | None = None
         self._review_index = 0
+        self._execution_results = []
         self._workflow_busy = False
-        self.size_sorter = None
         self._scan_generation = 0
         self._scan_started_at = 0.0
         self.scan_controller = ScanController()
@@ -122,6 +139,11 @@ class Clearspace(Gtk.Application):
         self._responsive_toggle = False
         self._folder_listing_generation = 0
         self._folder_rows = ()
+        self._child_store_cache: dict[int, Gio.ListStore] = {}
+        self._expanded_cache: OrderedDict[int, TreeEntry] = OrderedDict()
+        self._live_entry_count = 0
+        self._reserved_node_count = 0
+        self._selected_evaluations: dict[Path, RuleEvaluation] = {}
 
     def do_activate(self):
         self.window = Gtk.ApplicationWindow(application=self, title="Clearspace")
@@ -181,8 +203,6 @@ class Clearspace(Gtk.Application):
         )
         scan_bar.append(self.assistant_panel_button)
         outer.append(scan_bar)
-        self.size_sorter = Gtk.CustomSorter.new(self._compare_entries)
-
         self.panes = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True)
         outer.append(self.panes)
 
@@ -994,27 +1014,40 @@ class Clearspace(Gtk.Application):
         def scan_task(publish, cancel_event, pause_event):
             import shutil
 
-            def publish_live_progress(event: ProgressEvent) -> None:
-                if event.state in {
-                    ScanState.RUNNING,
-                    ScanState.PAUSED,
-                }:
-                    publish(event)
+            if not RustTreeScanner.available():
+                raise RustScannerError(
+                    "The SQLite scanner is unavailable. Build it with cargo build --release --manifest-path scanner/Cargo.toml."
+                )
+            started = time.monotonic()
 
-            scanner = TreeScanner(scan_root)
-            root = scanner.scan_root(
+            def publish_live_progress(event: dict) -> None:
+                publish(ProgressEvent(
+                    dirs_done=int(event.get("directories", 0)),
+                    dirs_total_est=None,
+                    files=int(event.get("files", 0)),
+                    bytes=int(event.get("allocated_bytes", 0)),
+                    elapsed_ms=int((time.monotonic() - started) * 1000),
+                    current_path=str(scan_root),
+                    state=ScanState.RUNNING,
+                    partial=bool(event.get("errors", 0)),
+                ))
+
+            scanner = RustTreeScanner(
+                scan_root,
+                max_visible_children=TREE_PAGE_SIZE,
+                include_hidden=scan_options.include_hidden,
+                stay_on_device=scan_options.stay_on_disk_only,
                 progress=publish_live_progress,
+            )
+            root = scanner.scan_root(
                 cancel_event=cancel_event,
                 pause_event=pause_event,
-                **scanner_arguments(scan_options),
             )
             evaluation = self.rule_engine.evaluate(root)
             inspection_roots = inspection_only_paths(scan_root)
             usage = shutil.disk_usage(scan_root)
             consumers = []
-            for node in root.children:
-                if node.aggregate_count:
-                    continue
+            for node in scanner.load_children_page(root, offset=0, limit=4, include_more=False):
                 node_evaluation = self.rule_engine.evaluate(node)
                 consumers.append(ScanConsumer(
                     node.path,
@@ -1046,6 +1079,11 @@ class Clearspace(Gtk.Application):
         if event.state not in {ScanState.DONE, ScanState.CANCELLED, ScanState.ERROR}:
             return GLib.SOURCE_CONTINUE
         self._scan_poll_source = None
+        if event.state is ScanState.CANCELLED:
+            self.scan_button.set_sensitive(True)
+            self._workflow_busy = False
+            self.stack.set_visible_child_name("choose")
+            return GLib.SOURCE_REMOVE
         if controller.error:
             self._finish_scan_error(controller.error)
             return GLib.SOURCE_REMOVE
@@ -1273,6 +1311,9 @@ class Clearspace(Gtk.Application):
             self.scan_button.set_sensitive(True)
             self._workflow_busy = False
             return GLib.SOURCE_REMOVE
+        old_scanner = self.scanner
+        if old_scanner is not None and old_scanner is not scanner:
+            old_scanner.close()
         self.scanner = scanner
         self.scan_report = report
         self.scan_report_button.set_sensitive(True)
@@ -1280,13 +1321,17 @@ class Clearspace(Gtk.Application):
         ui_build_started = time.monotonic()
         self.inspection_only_roots = inspection_roots
         self.selection = SelectionModel([root])
+        self._selected_evaluations.clear()
         self.entries.clear()
         self.check_buttons.clear()
+        self._child_store_cache.clear()
+        self._expanded_cache.clear()
+        self._live_entry_count = 0
+        self._reserved_node_count = 0
         self.root_entry = self._new_entry(root, evaluation)
         root_store = Gio.ListStore.new(TreeEntry)
         root_store.append(self.root_entry)
-        root_sorted = Gtk.SortListModel.new(root_store, self._size_sorter())
-        tree_model = Gtk.TreeListModel.new(root_sorted, False, False,
+        tree_model = Gtk.TreeListModel.new(root_store, False, False,
                                            self._create_children_model, None)
         self.tree_model = tree_model
         self.tree_selection = Gtk.SingleSelection.new(tree_model)
@@ -1379,11 +1424,13 @@ class Clearspace(Gtk.Application):
             node.selectable = False
         entry = TreeEntry(node, evaluation, parent_entry=parent_entry)
         entry.scanner = self.scanner
-        self.entries.setdefault(node.path, entry)
+        self._live_entry_count += 1
+        if node.selectable and not node.aggregate_count and not node.is_more_row:
+            self.entries[node.path] = entry
         return entry
 
     def _size_sorter(self):
-        return self.size_sorter
+        return None
 
     @staticmethod
     def _compare_entries(left: TreeEntry, right: TreeEntry, _data=None):
@@ -1398,61 +1445,300 @@ class Clearspace(Gtk.Application):
         return Gtk.Ordering.EQUAL
 
     def _create_children_model(self, entry: TreeEntry, _data=None):
-        if not entry.node.is_dir:
+        """Return a cached empty model only; GTK may call this as an expandability probe."""
+        node = entry.node
+        if (
+            entry.loading
+            or not node.is_dir
+            or node.error
+            or node.child_count <= 0
+            or node.node_id is None
+        ):
             return None
-        if entry.children_model is not None:
-            return entry.children_model
         if entry.children_store is None:
-            entry.children_store = Gio.ListStore.new(TreeEntry)
-        entry.children_model = Gtk.SortListModel.new(entry.children_store, self._size_sorter())
-        if not entry.loading_children:
-            entry.loading_children = True
-            loading_node = Node(entry.node.path, "Lendo…", False, 0, selectable=False)
-            entry.children_store.append(TreeEntry(loading_node, loading=True))
-            threading.Thread(target=self._load_children_worker, args=(entry,), daemon=True).start()
+            entry.children_store = self._child_store_cache.get(node.node_id)
+            if entry.children_store is None:
+                entry.children_store = Gio.ListStore.new(TreeEntry)
+                self._child_store_cache[node.node_id] = entry.children_store
+        entry.children_model = entry.children_store
         return entry.children_model
 
-    def _load_children_worker(self, entry: TreeEntry):
+    def _row_expanded_changed(self, row, _property, entry: TreeEntry):
+        node_id = entry.node.node_id
+        if row.get_expanded():
+            entry.is_expanded = True
+            if node_id is not None:
+                self._expanded_cache[node_id] = entry
+                self._expanded_cache.move_to_end(node_id)
+            self._start_page_load(entry, entry.node.loaded_child_count)
+            self._trim_expanded_cache()
+            return
+        entry.load_generation += 1
+        entry.is_expanded = False
+        entry.loading_children = False
+        self._remove_loading_rows(entry)
+        if node_id is not None:
+            self._expanded_cache.pop(node_id, None)
+        GLib.timeout_add(
+            TREE_EVICT_DELAY_MS,
+            self._evict_after_collapse,
+            entry,
+            entry.load_generation,
+        )
+
+    def _entry_is_expanded(self, entry: TreeEntry) -> bool:
+        return entry.is_expanded or any(
+            row.get_expanded() for row in tuple(entry.bound_rows)
+        )
+
+    def _trim_expanded_cache(self) -> None:
+        for node_id, entry in tuple(self._expanded_cache.items()):
+            if len(self._expanded_cache) <= TREE_EXPANDED_CACHE:
+                break
+            if self._entry_is_expanded(entry):
+                continue
+            self._expanded_cache.pop(node_id, None)
+            self._evict_entry_children(entry)
+
+    def _make_room_for_page(self, needed: int, keep: TreeEntry) -> bool:
+        while self._live_entry_count + self._reserved_node_count + needed > TREE_NODE_CAP:
+            victim = next(
+                (
+                    (node_id, entry)
+                    for node_id, entry in self._expanded_cache.items()
+                    if entry is not keep and not self._entry_is_expanded(entry)
+                ),
+                None,
+            )
+            if victim is None:
+                return False
+            node_id, entry = victim
+            self._expanded_cache.pop(node_id, None)
+            self._evict_entry_children(entry)
+        return True
+
+    def _start_page_load(self, entry: TreeEntry, offset: int) -> None:
+        if entry.loading_children or not entry.node.is_dir or entry.children_store is None:
+            return
+        self._remove_loading_rows(entry)
+        self._remove_page_tail(entry)
+        if offset >= entry.node.child_count:
+            return
+        requested = min(TREE_PAGE_SIZE, entry.node.child_count - offset)
+        if not self._make_room_for_page(requested + 3, entry):
+            requested = max(
+                0,
+                min(
+                    requested,
+                    TREE_NODE_CAP
+                    - self._live_entry_count
+                    - self._reserved_node_count
+                    - 3,
+                ),
+            )
+        if requested <= 0:
+            self.disk_label.set_text(
+                f"Node limit ({TREE_NODE_CAP:,}) reached; collapse a folder to continue"
+            )
+            return
+
+        entry.load_generation += 1
+        generation = entry.load_generation
+        entry.loading_children = True
+        self._reserved_node_count += requested + 2
+        loading_node = Node(
+            entry.node.path / ".clearspace-loading-row",
+            "Loading…",
+            False,
+            0,
+            selectable=False,
+        )
+        loading_entry = self._new_entry(loading_node, None, loading=True, parent_entry=entry)
+        store = entry.children_store
+        start = store.get_n_items()
+        remove = 0
+        if start and store.get_item(start - 1).node.path == loading_node.path:
+            remove = 1
+            start -= 1
+        store.splice(start, remove, [loading_entry])
+        scanner = entry.scanner
+        if scanner is None:
+            self._complete_page_load(entry, generation, offset, requested + 2, (), "Scanner is unavailable")
+            return
+        threading.Thread(
+            target=self._load_children_worker,
+            args=(entry, generation, offset, requested, requested + 2),
+            name="clearspace-tree-page",
+            daemon=True,
+        ).start()
+
+    def _remove_page_tail(self, entry: TreeEntry) -> None:
+        store = entry.children_store
+        if store is None:
+            return
+        remove = 0
+        count = store.get_n_items()
+        while count - remove > 0:
+            item = store.get_item(count - remove - 1)
+            if not (item.node.aggregate_count or item.node.is_more_row):
+                break
+            self._drop_entry(item, drop_store=False)
+            remove += 1
+        if remove:
+            store.splice(count - remove, remove, [])
+
+    def _remove_loading_rows(self, entry: TreeEntry) -> None:
+        store = entry.children_store
+        if store is None:
+            return
+        remove_at = []
+        for index in range(store.get_n_items()):
+            item = store.get_item(index)
+            if item.loading:
+                remove_at.append(index)
+                self._drop_entry(item, drop_store=False)
+        for index in reversed(remove_at):
+            store.remove(index)
+
+    def _load_children_worker(
+        self,
+        entry: TreeEntry,
+        generation: int,
+        offset: int,
+        limit: int,
+        reservation: int,
+    ):
         try:
-            if entry.scanner is not None:
-                entry.scanner.expand(entry.node)
-            children = tuple(entry.node.children)
+            children = entry.scanner.load_children_page(
+                entry.node,
+                offset=offset,
+                limit=limit,
+                include_more=True,
+            )
             evaluated = tuple(
-                (node, None if node.aggregate_count else self.rule_engine.evaluate(node))
+                (
+                    node,
+                    None if node.aggregate_count or node.is_more_row
+                    else self.rule_engine.evaluate(node),
+                )
                 for node in children
             )
             error = None
         except Exception as exc:
             evaluated = ()
             error = str(exc)
-        GLib.idle_add(self._show_children, entry, evaluated, error)
+        GLib.idle_add(
+            self._complete_page_load,
+            entry,
+            generation,
+            offset,
+            reservation,
+            evaluated,
+            error,
+        )
 
-    def _show_children(self, entry: TreeEntry, evaluated, error):
-        entry.children_store.remove_all()
+    def _complete_page_load(
+        self,
+        entry: TreeEntry,
+        generation: int,
+        offset: int,
+        reservation: int,
+        evaluated,
+        error,
+    ):
+        if generation != entry.load_generation:
+            self._reserved_node_count = max(0, self._reserved_node_count - reservation)
+            return GLib.SOURCE_REMOVE
+        if not self._entry_is_expanded(entry):
+            self._reserved_node_count = max(0, self._reserved_node_count - reservation)
+            entry.loading_children = False
+            self._remove_loading_rows(entry)
+            return GLib.SOURCE_REMOVE
+        store = entry.children_store
+        if store is None:
+            self._reserved_node_count = max(0, self._reserved_node_count - reservation)
+            entry.loading_children = False
+            return GLib.SOURCE_REMOVE
+        entries = []
         if error:
             entry.node.error = f"não foi possível ler: {error}"
             entry.node.size_is_partial = entry.node.size_bytes > 0
             error_node = Node(entry.node.path / ".clearspace-read-error", entry.node.error,
                               False, 0, error=entry.node.error, selectable=False)
-            entry.children_store.append(TreeEntry(error_node))
+            entries.append(self._new_entry(error_node, None, parent_entry=entry))
         else:
             for node, evaluation in evaluated:
-                entry.children_store.append(
-                    self._new_entry(node, evaluation, parent_entry=entry)
-                )
-        if entry.node.path == self.scan_root and not error:
-            self.scan_report["time_to_root_children_seconds"] = round(
-                time.monotonic() - self._scan_started_at, 3
-            )
-            self.scan_report["python_peak_rss_kib"] = resource.getrusage(
-                resource.RUSAGE_SELF
-            ).ru_maxrss
+                entries.append(self._new_entry(node, evaluation, parent_entry=entry))
+        loading_index = next(
+            (
+                index for index in range(store.get_n_items() - 1, -1, -1)
+                if store.get_item(index).loading
+            ),
+            store.get_n_items(),
+        )
+        loading_count = store.get_n_items() - loading_index
+        for index in range(loading_index, store.get_n_items()):
+            self._drop_entry(store.get_item(index), drop_store=False)
+        store.splice(loading_index, loading_count, entries)
+        self._reserved_node_count = max(0, self._reserved_node_count - reservation)
+        new_real_nodes = [
+            node for node, _evaluation in evaluated
+            if not node.aggregate_count and not node.is_more_row
+        ]
+        if offset == 0:
+            entry.node.children = new_real_nodes
+        else:
+            entry.node.children.extend(new_real_nodes)
+        entry.node.loaded_child_count = min(
+            entry.node.child_count, offset + len(new_real_nodes)
+        )
+        entry.node.loaded_child_size_bytes += sum(node.size_bytes for node in new_real_nodes)
+        entry.node.children_loaded = True
         entry.loading_children = False
-        self._size_sorter().changed(Gtk.SorterChange.DIFFERENT)
         if self._detail_entry is entry:
             self._show_details(entry)
         self._refresh_selection_summary()
         return GLib.SOURCE_REMOVE
+
+    def _evict_after_collapse(self, entry: TreeEntry, generation: int):
+        if generation == entry.load_generation and not self._entry_is_expanded(entry):
+            self._evict_entry_children(entry)
+        return GLib.SOURCE_REMOVE
+
+    def _evict_entry_children(self, entry: TreeEntry) -> None:
+        if self._entry_is_expanded(entry):
+            return
+        store = entry.children_store
+        if store is not None:
+            for index in range(store.get_n_items() - 1, -1, -1):
+                self._drop_entry(store.get_item(index), drop_store=True)
+            store.remove_all()
+        entry.node.children.clear()
+        entry.node.loaded_child_count = 0
+        entry.node.loaded_child_size_bytes = 0
+        entry.node.children_loaded = False
+        entry.children_store = None
+        entry.children_model = None
+        entry.loading_children = False
+        entry.load_generation += 1
+        node_id = entry.node.node_id
+        if node_id is not None:
+            self._child_store_cache.pop(node_id, None)
+            self._expanded_cache.pop(node_id, None)
+
+    def _drop_entry(self, entry: TreeEntry, *, drop_store: bool) -> None:
+        if drop_store and entry.children_store is not None:
+            for index in range(entry.children_store.get_n_items() - 1, -1, -1):
+                self._drop_entry(entry.children_store.get_item(index), drop_store=True)
+            entry.children_store.remove_all()
+        node_id = entry.node.node_id
+        if node_id is not None:
+            self._child_store_cache.pop(node_id, None)
+            self._expanded_cache.pop(node_id, None)
+        if self.entries.get(entry.node.path) is entry:
+            self.entries.pop(entry.node.path, None)
+        self.check_buttons.pop(entry.node.path, None)
+        self._live_entry_count = max(0, self._live_entry_count - 1)
 
     def _checkbox_column(self):
         factory = Gtk.SignalListItemFactory.new()
@@ -1519,6 +1805,7 @@ class Clearspace(Gtk.Application):
         factory = Gtk.SignalListItemFactory.new()
         factory.connect("setup", self._name_setup)
         factory.connect("bind", self._name_bind)
+        factory.connect("unbind", self._name_unbind)
         column = Gtk.ColumnViewColumn.new("Arquivo ou pasta", factory)
         return column
 
@@ -1527,8 +1814,13 @@ class Clearspace(Gtk.Application):
         box = Gtk.Box(spacing=8)
         icon = Gtk.Image()
         label = Gtk.Label(xalign=0, hexpand=True, ellipsize=3)
+        more_button = Gtk.Button(label="Show more")
+        more_button.set_visible(False)
+        more_button.add_css_class("flat")
+        more_button.connect("clicked", self._show_more_clicked)
         box.append(icon)
         box.append(label)
+        box.append(more_button)
         expander.set_child(box)
         list_item.set_child(expander)
 
@@ -1537,20 +1829,60 @@ class Clearspace(Gtk.Application):
         tree_row = list_item.get_item()
         entry = tree_row.get_item()
         expander.set_list_row(tree_row)
+        old_signal = getattr(list_item, "_clearspace_expanded_signal", None)
+        if old_signal:
+            old_row, handler_id = old_signal
+            if old_row.handler_is_connected(handler_id):
+                old_row.disconnect(handler_id)
+            old_entry = old_row.get_item()
+            if old_entry is not None:
+                old_entry.bound_rows.discard(old_row)
+        handler_id = tree_row.connect(
+            "notify::expanded", self._row_expanded_changed, entry
+        )
+        list_item._clearspace_expanded_signal = (tree_row, handler_id)
+        entry.bound_rows.add(tree_row)
         box = expander.get_child()
         icon = box.get_first_child()
         label = icon.get_next_sibling()
+        more_button = label.get_next_sibling()
         if entry.loading:
             icon.set_from_icon_name("content-loading-symbolic")
             label.set_text("Lendo…")
+            more_button.set_visible(False)
+        elif entry.node.is_more_row:
+            icon.set_from_icon_name("view-more-symbolic")
+            label.set_text(entry.node.name)
+            more_button.set_visible(True)
+            more_button.set_sensitive(True)
+            more_button._clearspace_entry = entry
         else:
             icon.set_from_icon_name("folder-symbolic" if entry.node.is_dir else "text-x-generic-symbolic")
             label.set_text(entry.node.name)
             label.set_tooltip_text(entry.node.error)
+            more_button.set_visible(False)
             if entry.node.error:
                 label.add_css_class("error")
             else:
                 label.remove_css_class("error")
+        if tree_row.get_expanded():
+            self._row_expanded_changed(tree_row, None, entry)
+
+    def _name_unbind(self, _factory, list_item):
+        signal = getattr(list_item, "_clearspace_expanded_signal", None)
+        if signal:
+            row, handler_id = signal
+            entry = row.get_item()
+            if entry is not None:
+                entry.bound_rows.discard(row)
+            if row.handler_is_connected(handler_id):
+                row.disconnect(handler_id)
+            list_item._clearspace_expanded_signal = None
+
+    def _show_more_clicked(self, button):
+        entry = getattr(button, "_clearspace_entry", None)
+        if entry is not None and entry.parent_entry is not None:
+            self._start_page_load(entry.parent_entry, entry.node.more_offset)
 
     def _usage_column(self):
         factory = Gtk.SignalListItemFactory.new()
@@ -1627,7 +1959,7 @@ class Clearspace(Gtk.Application):
         label = list_item.get_child()
         for css in ("risk-low", "risk-moderate", "risk-user-data", "risk-critical"):
             label.remove_css_class(css)
-        if entry.node.aggregate_count:
+        if entry.node.aggregate_count or entry.node.is_more_row or entry.loading:
             label.set_text("—")
             return
         risk = entry.evaluation.risk if entry.evaluation else Risk.MODERATE
@@ -1676,6 +2008,9 @@ class Clearspace(Gtk.Application):
             if tree_row.get_expanded():
                 tree_row.set_expanded(False)
                 return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and entry.node.is_more_row:
+            self._start_page_load(entry.parent_entry, entry.node.more_offset)
+            return True
             parent_row = tree_row.get_parent()
             if parent_row is not None:
                 self.tree_selection.set_selected(parent_row.get_position())
@@ -1687,6 +2022,7 @@ class Clearspace(Gtk.Application):
         selected_name = (
             entry.node.name
             if entry and not entry.loading and not entry.node.aggregate_count
+            and not entry.node.is_more_row
             else "the selected item"
         )
         self.explain_risk_chip.set_label(f"Explain the risk of {selected_name}")
@@ -1712,7 +2048,7 @@ class Clearspace(Gtk.Application):
             f"Agrupa {entry.node.aggregate_count} itens menores nesta pasta."
             if entry.node.aggregate_count else str(entry.node.path)
         )
-        if entry.node.aggregate_count:
+        if entry.node.aggregate_count or entry.node.is_more_row:
             self.detail_warning.set_text("Linha informativa; os itens agrupados não podem ser selecionados individualmente.")
             self.detail_procedure.set_text("")
             self.copy_procedure_button.set_visible(False)
@@ -1767,17 +2103,12 @@ class Clearspace(Gtk.Application):
         if not self.selection:
             return
         paths = self.selection.selected_paths
-        selected_entries = [self.entries[path] for path in paths if path in self.entries]
         total = self.selection.estimated_size_bytes
-        if len(selected_entries) != len(paths):
-            # SelectionModel roots hold the live Node tree, including lazily loaded
-            # descendants. Resolve from that tree so aggregate risk remains correct.
-            by_path = {node.path: node for node in self._walk_nodes(self.root_node)}
-            selected_nodes = [by_path[path] for path in paths if path in by_path]
-            selected_entries = [self.entries.get(node.path) or TreeEntry(
-                node, self.rule_engine.evaluate(node)) for node in selected_nodes]
         max_risk = max(
-            (entry.evaluation.risk for entry in selected_entries if entry.evaluation),
+            (
+                self._selected_evaluations[path].risk
+                for path in paths if path in self._selected_evaluations
+            ),
             key=self._risk_rank,
             default=None,
         )
@@ -1792,14 +2123,6 @@ class Clearspace(Gtk.Application):
             f"highest risk: {risk_text}"
         )
         self.review_button.set_sensitive(bool(paths) and not self._workflow_busy)
-
-    @staticmethod
-    def _walk_nodes(node):
-        if node is None:
-            return
-        yield node
-        for child in node.children:
-            yield from Clearspace._walk_nodes(child)
 
     @staticmethod
     def _risk_rank(risk: Risk) -> int:
@@ -1826,13 +2149,15 @@ class Clearspace(Gtk.Application):
 
     def _review_worker(self, paths, risks, warnings):
         try:
-            active = discover_active_paths(self.scan_root) + self.inspection_only_roots
+            scan_root = self.scanner.root_path if self.scanner else self.scan_root
+            active = discover_active_paths(scan_root) + self.inspection_only_roots
             review = build_review(
                 paths,
-                allowed_root=self.scan_root,
+                allowed_root=scan_root,
                 risks=risks,
                 warnings=warnings,
                 active_paths=active,
+                trash_support=gio_trash_supported,
             )
             error = None
         except Exception as exc:
@@ -1847,6 +2172,7 @@ class Clearspace(Gtk.Application):
             self._show_message("Revisão bloqueada", error or "Não foi possível revisar a seleção.")
             return GLib.SOURCE_REMOVE
         self._review = review
+        self._execution_results = []
         lines = []
         for item in review.items:
             lines.append(
@@ -1937,6 +2263,9 @@ class Clearspace(Gtk.Application):
 
     def _ask_item_confirmation(self, item: ReviewedItem, *, user_data_confirmed=False):
         action = self._review_action
+        if action is FileAction.TRASH and item.trash_supported is False:
+            self._ask_unavailable_trash_confirmation(item, user_data_confirmed)
+            return
         action_label = "Mover para lixeira" if action is FileAction.TRASH else "Excluir permanentemente"
         dialog = Gtk.AlertDialog()
         dialog.set_message(f"Confirmar item {self._review_index + 1} de {len(self._review.items)}")
@@ -1949,6 +2278,37 @@ class Clearspace(Gtk.Application):
         dialog.set_default_button(0)
         callback = self._permanent_item_response if action is FileAction.PERMANENT else self._trash_item_response
         dialog.choose(self.window, None, callback, (item, user_data_confirmed))
+
+    def _ask_unavailable_trash_confirmation(self, item, user_data_confirmed):
+        dialog = Gtk.Dialog(title="Lixeira indisponível", transient_for=self.window, modal=True)
+        dialog.add_button("Cancelar plano", Gtk.ResponseType.CANCEL)
+        dialog.add_button("Continuar sem este item", Gtk.ResponseType.APPLY)
+        dialog.add_button("Excluir permanentemente", Gtk.ResponseType.ACCEPT)
+        content = dialog.get_content_area()
+        content.append(Gtk.Label(
+            label=f"Este local não tem lixeira (partição diferente do home)\n{item.path}",
+            xalign=0, wrap=True,
+        ))
+        option = Gtk.CheckButton(label="Excluir permanentemente")
+        option.set_active(False)
+        content.append(option)
+        command = "rm -r -- " + shlex.quote(str(item.path))
+        content.append(Gtk.Label(label=f"Comando equivalente (para uso por conta própria):\n{command}",
+                                 xalign=0, wrap=True, selectable=True))
+        dialog.connect("response", self._unavailable_trash_response,
+                       item, user_data_confirmed, option)
+        dialog.present()
+
+    def _unavailable_trash_response(self, dialog, response, item, user_data_confirmed, option):
+        selected = option.get_active()
+        dialog.destroy()
+        if response == Gtk.ResponseType.CANCEL:
+            self._cancel_review_plan()
+        elif response == Gtk.ResponseType.ACCEPT and selected:
+            self._typed_confirmation_dialog(item, user_data_confirmed)
+        else:
+            result = ItemExecutor(self.history, active_paths=()).record_skip(self._review, item)
+            self._item_finished(result)
 
     def _trash_item_response(self, dialog, result, state):
         try:
@@ -2002,9 +2362,10 @@ class Clearspace(Gtk.Application):
     def _execute_item(self, item, action, user_data_confirmed, typed_confirmation):
         self._set_workflow_busy(True)
         self.disk_label.set_text(f"Executando uma ação: {item.path.name}…")
+        scan_root = self._review.allowed_root
         executor = ItemExecutor(
             self.history,
-            active_paths=lambda: discover_active_paths(self.scan_root)
+            active_paths=lambda: discover_active_paths(scan_root)
             + self.inspection_only_roots,
         )
         threading.Thread(
@@ -2024,36 +2385,64 @@ class Clearspace(Gtk.Application):
         GLib.idle_add(self._item_finished, result)
 
     def _item_finished(self, result):
-        if not result.success:
-            record = result.record
-            before = record.get("filesystem_before") or {}
-            after = record.get("filesystem_after") or {}
-            details = record.get("failure_details") or "Falha sem detalhes."
-            self._show_message(
-                "Ação falhou",
-                f"{details}\n\nEspaço livre antes: {self._free_space_text(before)}"
-                f"\nEspaço livre depois: {self._free_space_text(after)}",
-            )
-            self._cancel_review_plan()
-            return GLib.SOURCE_REMOVE
+        self._execution_results.append(result)
         self._review_index += 1
         if self._review_index >= len(self._review.items):
-            record = result.record
-            before = record.get("filesystem_before") or {}
-            after = record.get("filesystem_after") or {}
-            self._show_message(
-                "Revisão concluída",
-                f"Ações confirmadas concluídas.\nEspaço livre antes: {self._free_space_text(before)}"
-                f"\nEspaço livre depois: {self._free_space_text(after)}\n\n"
-                "Ao mover para a lixeira, o espaço só é liberado ao esvaziá-la.",
-            )
-            self._review = None
-            self._review_action = None
-            self._set_workflow_busy(False)
-            self.scan()
+            self._show_execution_summary()
             return GLib.SOURCE_REMOVE
         self._confirm_next_item()
         return GLib.SOURCE_REMOVE
+
+    def _show_execution_summary(self):
+        results = tuple(self._execution_results)
+        succeeded = sum(result.success for result in results)
+        failed = len(results) - succeeded
+        verb = "movidos" if self._review_action is FileAction.TRASH else "excluídos"
+        dialog = Gtk.Dialog(title="Resumo da execução", transient_for=self.window, modal=True)
+        dialog.add_button("Fechar", Gtk.ResponseType.CLOSE)
+        content = dialog.get_content_area()
+        content.append(Gtk.Label(label=f"{succeeded} {verb}, {failed} falharam", xalign=0))
+        if self._review_action is FileAction.TRASH:
+            content.append(Gtk.Label(
+                label="O espaço só é liberado ao esvaziar a lixeira.", xalign=0
+            ))
+        for result in results:
+            if result.success:
+                continue
+            record = result.record
+            kind = record.get("failure_kind")
+            messages = {
+                "app_protected": "Bloqueado pelas proteções do Clearspace",
+                "filesystem_permission": "Sem permissão do sistema de arquivos",
+                "trash_unavailable": "Lixeira indisponível neste filesystem",
+                "missing": "O item não existe mais",
+            }
+            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            detail = Gtk.Label(
+                label=f"{messages.get(kind, 'Falha na operação')}: {result.path}\n"
+                f"{record.get('failure_message') or record.get('failure_details') or ''}",
+                xalign=0,
+                wrap=True,
+                hexpand=True,
+            )
+            row.append(detail)
+            copy_button = Gtk.Button(label="Copiar caminho")
+            copy_button.connect("clicked", self._copy_failed_path, str(result.path))
+            row.append(copy_button)
+            content.append(row)
+        dialog.connect("response", self._execution_summary_closed)
+        dialog.present()
+
+    def _copy_failed_path(self, _button, path):
+        self.window.get_display().get_clipboard().set(path)
+
+    def _execution_summary_closed(self, dialog, _response):
+        dialog.destroy()
+        self._review = None
+        self._review_action = None
+        self._execution_results = []
+        self._set_workflow_busy(False)
+        self.scan()
 
     @staticmethod
     def _free_space_text(record):

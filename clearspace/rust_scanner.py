@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import shutil
 import sqlite3
 import subprocess
@@ -24,11 +25,13 @@ class RustTreeScanner:
         self,
         root_path: Path,
         *,
-        max_visible_children: int = 100,
+        max_visible_children: int = 200,
         binary: Path | None = None,
         progress: Callable[[dict], None] | None = None,
         cache_dir: Path | None = None,
         exclusions: tuple[Path, ...] = (),
+        include_hidden: bool = True,
+        stay_on_device: bool = True,
     ) -> None:
         self.root_path = Path(root_path)
         self.max_visible_children = max_visible_children
@@ -68,6 +71,8 @@ class RustTreeScanner:
             self._temporary_directory = tempfile.TemporaryDirectory(prefix="scan-")
         self.database_path = Path(self._temporary_directory.name) / "inventory.sqlite"
         self.exclusions = tuple(exclusions)
+        self.include_hidden = include_hidden
+        self.stay_on_device = stay_on_device
         self.report: dict[str, int | float | str] = {}
         self._closed = False
 
@@ -89,8 +94,12 @@ class RustTreeScanner:
     def available(cls) -> bool:
         return cls._find_binary() is not None
 
-    def scan_root(self) -> Node:
+    def scan_root(self, *, cancel_event=None, pause_event=None) -> Node:
         argv = [str(self.binary), str(self.root_path), "--db", str(self.database_path)]
+        if not self.include_hidden:
+            argv.append("--exclude-hidden")
+        if not self.stay_on_device:
+            argv.append("--cross-filesystems")
         for excluded in self.exclusions:
             argv.extend(("--exclude", str(excluded)))
         try:
@@ -114,6 +123,18 @@ class RustTreeScanner:
         try:
             assert process.stdout is not None
             for line in process.stdout:
+                if cancel_event is not None and cancel_event.is_set():
+                    process.terminate()
+                    process.wait()
+                    raise RustScannerError("scan cancelled")
+                if pause_event is not None and not pause_event.is_set():
+                    process.send_signal(signal.SIGSTOP)
+                    while not pause_event.wait(timeout=0.1):
+                        if cancel_event is not None and cancel_event.is_set():
+                            process.terminate()
+                            process.wait()
+                            raise RustScannerError("scan cancelled")
+                    process.send_signal(signal.SIGCONT)
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError as error:
@@ -178,7 +199,8 @@ class RustTreeScanner:
         self._root_id = terminal["root_id"]
         with closing(self._connect()) as connection:
             row = connection.execute(
-                "SELECT size_blocks, mtime, error, partial FROM nodes WHERE id=?",
+                "SELECT size_blocks, mtime, error, partial, child_count, child_size_blocks "
+                "FROM nodes WHERE id=?",
                 (self._root_id,),
             ).fetchone()
         if row is None:
@@ -192,6 +214,9 @@ class RustTreeScanner:
             children_loaded=False,
             size_is_partial=bool(row[3]),
             selectable=False,
+            node_id=self._root_id,
+            child_count=row[4],
+            child_size_bytes=row[5] * 512,
         )
 
     @staticmethod
@@ -215,7 +240,7 @@ class RustTreeScanner:
         uri = self.database_path.as_uri() + "?mode=ro"
         return sqlite3.connect(uri, uri=True)
 
-    def expand(self, node: Node) -> list[Node]:
+    def _expand_legacy(self, node: Node) -> list[Node]:
         if not node.is_dir or node.children_loaded:
             return node.children
         with closing(self._connect()) as connection:
@@ -261,6 +286,93 @@ class RustTreeScanner:
             )
         node.children_loaded = True
         return node.children
+
+    def expand(self, node: Node) -> list[Node]:
+        if not node.is_dir or node.children_loaded:
+            return node.children
+        node.children = self.load_children_page(
+            node,
+            offset=0,
+            limit=self.max_visible_children,
+            include_more=False,
+        )
+        node.children_loaded = True
+        return node.children
+
+    def load_children_page(
+        self,
+        node: Node,
+        *,
+        offset: int = 0,
+        limit: int | None = None,
+        include_more: bool = True,
+    ) -> list[Node]:
+        """Read one size-sorted child page from the private scan database."""
+        if not node.is_dir or offset < 0:
+            return []
+        page_size = self.max_visible_children if limit is None else max(1, int(limit))
+        parent_id = node.node_id
+        with closing(self._connect()) as connection:
+            if parent_id is None:
+                parent_id = self._node_id(node.path, connection)
+            rows = connection.execute(
+                "SELECT id,parent_id,name,is_dir,size_blocks,error,partial,child_count,child_size_blocks "
+                "FROM nodes WHERE parent_id=? "
+                "ORDER BY size_blocks DESC, name COLLATE BINARY ASC LIMIT ? OFFSET ?",
+                (parent_id, page_size, offset),
+            ).fetchall()
+        page = [
+            Node(
+                node.path / name,
+                name,
+                bool(is_dir),
+                size_blocks * 512,
+                error=error,
+                children_loaded=not bool(is_dir),
+                size_is_partial=bool(partial),
+                selectable=error is None,
+                node_id=node_id,
+                parent_id=row_parent_id,
+                child_count=child_count,
+                child_size_bytes=child_size_blocks * 512,
+            )
+            for (
+                node_id, row_parent_id, name, is_dir, size_blocks, error,
+                partial, child_count, child_size_blocks,
+            ) in rows
+        ]
+        remaining_count = max(0, node.child_count - offset - len(page))
+        if remaining_count:
+            remaining_size = max(
+                0,
+                node.child_size_bytes
+                - node.loaded_child_size_bytes
+                - sum(child.size_bytes for child in page),
+            )
+            page.append(Node(
+                node.path / ".clearspace-aggregate-row",
+                f"{remaining_count:,} smaller items",
+                False,
+                remaining_size,
+                children_loaded=True,
+                selectable=False,
+                aggregate_count=remaining_count,
+                parent_id=parent_id,
+            ))
+            if include_more:
+                next_offset = offset + len(rows)
+                page.append(Node(
+                    node.path / ".clearspace-show-more-row",
+                    f"Showing the biggest {next_offset:,} of {node.child_count:,} · Show more",
+                    False,
+                    0,
+                    children_loaded=True,
+                    selectable=False,
+                    parent_id=parent_id,
+                    is_more_row=True,
+                    more_offset=next_offset,
+                ))
+        return page
 
     def _node_id(self, path: Path, connection: sqlite3.Connection) -> int:
         if path == self.root_path:

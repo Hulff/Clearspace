@@ -23,10 +23,12 @@ CREATE TABLE nodes (
     size_blocks INTEGER NOT NULL CHECK (size_blocks >= 0),
     mtime       INTEGER,
     error       TEXT,
-    partial     INTEGER NOT NULL DEFAULT 0 CHECK (partial IN (0, 1))
+    partial     INTEGER NOT NULL DEFAULT 0 CHECK (partial IN (0, 1)),
+    child_count INTEGER NOT NULL DEFAULT 0,
+    child_size_blocks INTEGER NOT NULL DEFAULT 0
 );
 
-CREATE INDEX nodes_parent_size_idx ON nodes(parent_id, size_blocks DESC);
+CREATE INDEX nodes_parent_size_idx ON nodes(parent_id, size_blocks DESC, name COLLATE BINARY ASC);
 ```
 
 The root is the single row whose `parent_id` is `NULL`. `name` is a basename,

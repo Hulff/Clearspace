@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from pathlib import Path
 
 import pytest
@@ -183,6 +184,136 @@ def test_failed_gio_action_is_logged_as_failure(tmp_path: Path) -> None:
     assert result.record["result"] == "failed"
     assert "trash unavailable" in result.record["failure_details"]
     assert history.records == [result.record]
+
+
+def test_chosen_root_outside_home_is_the_single_path_source(tmp_path: Path) -> None:
+    root = tmp_path / "chosen-folder"
+    root.mkdir()
+    target = root / "nested" / "cache.bin"
+    target.parent.mkdir()
+    target.write_bytes(b"cache")
+    review = build_review([target], allowed_root=root, active_paths=())
+    history = MemoryHistory()
+    trash = FakeTrash()
+
+    result = ItemExecutor(history, trash=trash, active_paths=()).execute_one(review, target)
+
+    assert root != Path.home()
+    assert review.allowed_root == root.resolve()
+    assert review.items[0].path == target.resolve()
+    assert result.success
+    assert trash.paths == [root / "nested" / "cache.bin"]
+    assert history.records[0]["path"] == str(target.resolve())
+    for protected_root in (Path("/"), Path("/usr"), Path.home()):
+        with pytest.raises(UnsafePathError, match="protegida"):
+            build_review([], allowed_root=protected_root, active_paths=())
+    with pytest.raises(UnsafePathError, match="fora da raiz"):
+        build_review([Path.home() / "not-a-target"], allowed_root=root, active_paths=())
+
+
+def test_permission_failure_is_recorded_and_later_item_still_executes(tmp_path: Path) -> None:
+    root = tmp_path / "chosen"
+    blocked_parent = root / "read-only"
+    writable_parent = root / "writable"
+    blocked_parent.mkdir(parents=True)
+    writable_parent.mkdir()
+    blocked = blocked_parent / "blocked.bin"
+    later = writable_parent / "later.bin"
+    blocked.write_bytes(b"blocked")
+    later.write_bytes(b"later")
+    blocked_parent.chmod(0o555)
+    try:
+        review = build_review(
+            [blocked, later], allowed_root=root, active_paths=()
+        )
+        assert any("não permite escrita" in warning for warning in review.items[0].warnings)
+        history = MemoryHistory()
+        executor = ItemExecutor(history, active_paths=())
+        first = executor.execute_one(
+            review, blocked, FileAction.PERMANENT,
+            typed_confirmation=PERMANENT_CONFIRMATION,
+        )
+        second = executor.execute_one(
+            review, later, FileAction.PERMANENT,
+            typed_confirmation=PERMANENT_CONFIRMATION,
+        )
+
+        assert not first.success
+        assert first.record["failure_kind"] == "filesystem_permission"
+        assert first.record["exception_type"] == "PermissionError"
+        assert second.success
+        assert not later.exists()
+        assert len(history.records) == 2
+    finally:
+        blocked_parent.chmod(0o755)
+
+
+def test_missing_and_protected_items_have_distinct_failure_categories(tmp_path: Path) -> None:
+    root, target = make_target(tmp_path)
+    review = build_review([target], allowed_root=root, active_paths=())
+    target.unlink()
+
+    missing = ItemExecutor(MemoryHistory(), active_paths=()).execute_one(review, target)
+    assert not missing.success
+    assert missing.record["failure_kind"] == "missing"
+    assert missing.record["exception_type"] == "FileNotFoundError"
+
+    protected = root / "protected"
+    protected.write_text("protected", encoding="utf-8")
+    previous = executor_module.SYSTEM_PROTECTED
+    executor_module.SYSTEM_PROTECTED = (*previous, str(protected))
+    try:
+        with pytest.raises(UnsafePathError, match="protegido"):
+            build_review([protected], allowed_root=root, active_paths=())
+        assert executor_module._error_kind(UnsafePathError("blocked")) == "app_protected"
+    finally:
+        executor_module.SYSTEM_PROTECTED = previous
+
+
+def test_gio_not_supported_retains_domain_and_code_as_trash_unavailable() -> None:
+    class GioLikeError(Exception):
+        domain = "g-io-error-quark"
+        code = 15
+
+    assert executor_module._error_kind(GioLikeError()) == "trash_unavailable"
+
+
+def test_gio_code_15_is_lixeira_indisponivel_not_permission(tmp_path: Path) -> None:
+    class GioLikeError(Exception):
+        domain = "g-io-error-quark"
+        code = 15
+
+    root, target = make_target(tmp_path)
+    review = build_review([target], allowed_root=root, active_paths=(),
+                          trash_support=lambda _path: False)
+    result = ItemExecutor(
+        MemoryHistory(), trash=FakeTrash(GioLikeError()), active_paths=()
+    ).execute_one(review, target)
+
+    assert not result.success
+    assert result.record["failure_kind"] == "trash_unavailable"
+    assert result.record["failure_kind"] != "filesystem_permission"
+    assert result.record["glib_domain"] == "g-io-error-quark"
+    assert result.record["glib_code"] == 15
+
+
+def test_review_flags_item_on_filesystem_different_from_home(tmp_path: Path) -> None:
+    root, target = make_target(tmp_path)
+    home_device = target.stat().st_dev + 1
+    review = build_review([target], allowed_root=root, active_paths=(),
+                          home_device=home_device, trash_support=lambda _path: True)
+
+    assert review.items[0].trash_supported is False
+    assert "Este local não tem lixeira (partição diferente do home)" in review.items[0].warnings
+
+
+def test_review_warns_when_item_owner_differs(tmp_path: Path, monkeypatch) -> None:
+    root, target = make_target(tmp_path)
+    monkeypatch.setattr(executor_module.os, "getuid", lambda: target.stat().st_uid + 1)
+
+    review = build_review([target], allowed_root=root, active_paths=())
+
+    assert any("pertence ao UID" in warning for warning in review.items[0].warnings)
 
 
 def test_permanent_delete_removes_tree_without_following_internal_symlink(tmp_path: Path) -> None:

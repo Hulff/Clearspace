@@ -56,7 +56,7 @@ fn json_escape(value: &str) -> String {
     result
 }
 
-fn parse_args() -> Result<(PathBuf, PathBuf, Vec<PathBuf>), String> {
+fn parse_args() -> Result<(PathBuf, PathBuf, Vec<PathBuf>, bool, bool), String> {
     let mut args = env::args_os().skip(1);
     let root = PathBuf::from(
         args.next()
@@ -64,6 +64,8 @@ fn parse_args() -> Result<(PathBuf, PathBuf, Vec<PathBuf>), String> {
     );
     let mut db = None;
     let mut excludes = Vec::new();
+    let mut include_hidden = true;
+    let mut stay_on_device = true;
     while let Some(arg) = args.next() {
         if arg == "--db" {
             db = Some(PathBuf::from(args.next().ok_or("--db requires a path")?));
@@ -71,11 +73,15 @@ fn parse_args() -> Result<(PathBuf, PathBuf, Vec<PathBuf>), String> {
             excludes.push(PathBuf::from(
                 args.next().ok_or("--exclude requires a path")?,
             ));
+        } else if arg == "--exclude-hidden" {
+            include_hidden = false;
+        } else if arg == "--cross-filesystems" {
+            stay_on_device = false;
         } else {
             return Err(format!("unknown argument: {}", arg.to_string_lossy()));
         }
     }
-    Ok((root, db.ok_or("--db is required")?, excludes))
+    Ok((root, db.ok_or("--db is required")?, excludes, include_hidden, stay_on_device))
 }
 
 struct NodeRow<'a> {
@@ -168,6 +174,8 @@ fn process(
     root_arg: &Path,
     db_arg: &Path,
     exclusions: &[PathBuf],
+    include_hidden: bool,
+    stay_on_device: bool,
 ) -> Result<(Counts, i64), String> {
     let absolute_root = if root_arg.is_absolute() {
         root_arg.to_path_buf()
@@ -223,7 +231,7 @@ fn process(
     let _temp_guard = TempDatabase(temp.clone());
     let conn = Connection::open(&temp).map_err(|e| format!("database: {e}"))?;
     conn.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA foreign_keys=ON;
-        CREATE TABLE nodes(id INTEGER PRIMARY KEY,parent_id INTEGER REFERENCES nodes(id),name TEXT NOT NULL,is_dir INTEGER NOT NULL CHECK(is_dir IN (0,1)),size_blocks INTEGER NOT NULL CHECK(size_blocks>=0),mtime INTEGER,error TEXT,partial INTEGER NOT NULL DEFAULT 0 CHECK(partial IN (0,1)));
+        CREATE TABLE nodes(id INTEGER PRIMARY KEY,parent_id INTEGER REFERENCES nodes(id),name TEXT NOT NULL,is_dir INTEGER NOT NULL CHECK(is_dir IN (0,1)),size_blocks INTEGER NOT NULL CHECK(size_blocks>=0),mtime INTEGER,error TEXT,partial INTEGER NOT NULL DEFAULT 0 CHECK(partial IN (0,1)),child_count INTEGER NOT NULL DEFAULT 0,child_size_blocks INTEGER NOT NULL DEFAULT 0);
         CREATE TABLE scan_paths(path TEXT PRIMARY KEY,id INTEGER NOT NULL,depth INTEGER NOT NULL);")
         .map_err(|e|format!("schema: {e}"))?;
     conn.execute_batch("BEGIN IMMEDIATE")
@@ -261,7 +269,7 @@ fn process(
     let excluded_cb = Arc::new(excludes);
     let excluded_for_cb = Arc::clone(&excluded_cb);
     let walker = WalkDir::new(&root)
-        .skip_hidden(false)
+        .skip_hidden(!include_hidden)
         .follow_links(false)
         .process_read_dir(move |_depth, _path, _state, entries| {
             entries.retain_mut(|item| {
@@ -278,7 +286,7 @@ fn process(
                         skipped_symlinks_cb.fetch_add(1, Ordering::Relaxed);
                         false
                     }
-                    Ok(meta) if meta.dev() != device => {
+                    Ok(meta) if stay_on_device && meta.dev() != device => {
                         skipped_mounts_cb.fetch_add(1, Ordering::Relaxed);
                         entry.read_children_path = None;
                         false
@@ -375,7 +383,7 @@ fn process(
             counts.symlinks_skipped += 1;
             continue;
         }
-        if metadata.dev() != device {
+        if stay_on_device && metadata.dev() != device {
             counts.other_filesystems_skipped += 1;
             continue;
         }
@@ -429,9 +437,14 @@ fn process(
         }
     }
     aggregate_directories(&conn)?;
+    conn.execute_batch("CREATE INDEX nodes_parent_idx ON nodes(parent_id);
+        CREATE TEMP TABLE child_totals AS SELECT parent_id,COUNT(*) AS child_count,COALESCE(SUM(size_blocks),0) AS child_size_blocks FROM nodes WHERE parent_id IS NOT NULL GROUP BY parent_id;
+        UPDATE nodes SET child_count=COALESCE((SELECT child_count FROM child_totals WHERE child_totals.parent_id=nodes.id),0),child_size_blocks=COALESCE((SELECT child_size_blocks FROM child_totals WHERE child_totals.parent_id=nodes.id),0) WHERE is_dir=1;
+        DROP TABLE child_totals;")
+        .map_err(|error| format!("compute child counts: {error}"))?;
     counts.other_filesystems_skipped = skipped_mounts.load(Ordering::Relaxed);
     counts.symlinks_skipped = skipped_symlinks.load(Ordering::Relaxed);
-    conn.execute_batch("DROP TABLE scan_paths; CREATE INDEX nodes_parent_size_idx ON nodes(parent_id,size_blocks DESC); COMMIT;")
+    conn.execute_batch("DROP TABLE scan_paths; CREATE INDEX nodes_parent_size_idx ON nodes(parent_id,size_blocks DESC,name COLLATE BINARY ASC); COMMIT;")
         .map_err(|e|format!("finalize database: {e}"))?;
     drop(conn);
     fs::rename(&temp, &db).map_err(|e| format!("publish database: {e}"))?;
@@ -446,7 +459,7 @@ fn entry_depth_hint(path: &Path, root: &Path) -> usize {
 
 fn main() {
     let started = Instant::now();
-    let (root, db, excludes) = match parse_args() {
+    let (root, db, excludes, include_hidden, stay_on_device) = match parse_args() {
         Ok(v) => v,
         Err(e) => {
             eprintln!("{e}");
@@ -457,7 +470,7 @@ fn main() {
         eprintln!("{e}");
         std::process::exit(1);
     }
-    match process(&root, &db, &excludes) {
+    match process(&root, &db, &excludes, include_hidden, stay_on_device) {
         Ok((c, root_id)) => {
             let first_progress_ms = c
                 .first_progress_ms
@@ -527,7 +540,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("linked")).expect("create symlink");
         let db = temp.0.join("state/scan.sqlite");
 
-        let (counts, root_id) = process(&root, &db, &[]).expect("scan fixture");
+        let (counts, root_id) = process(&root, &db, &[], true, true).expect("scan fixture");
         let conn = Connection::open(&db).expect("open output database");
         let root_size: i64 = conn
             .query_row(
@@ -577,7 +590,7 @@ mod tests {
             .expect("remove permissions");
         let can_read = fs::read_dir(&blocked).is_ok();
         let db = temp.0.join("scan.sqlite");
-        let (counts, _) = process(&root, &db, &[]).expect("scan permission fixture");
+        let (counts, _) = process(&root, &db, &[], true, true).expect("scan permission fixture");
         fs::set_permissions(&blocked, fs::Permissions::from_mode(0o700))
             .expect("restore permissions");
         if !can_read {
@@ -601,7 +614,7 @@ mod tests {
             fs::write(root.join(format!("file-{i}")), b"x").expect("write synthetic file");
         }
         let db = temp.0.join("scan.sqlite");
-        let (counts, _) = process(&root, &db, &[]).expect("scan large fixture");
+        let (counts, _) = process(&root, &db, &[], true, true).expect("scan large fixture");
         assert_eq!(counts.files, 1500);
     }
 }
