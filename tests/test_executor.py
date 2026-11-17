@@ -133,16 +133,24 @@ def test_canonical_protected_roots_are_blocked(tmp_path: Path, monkeypatch) -> N
         build_review([protected / "config"], allowed_root=root)
 
 
-def test_nested_symlink_outside_root_blocks_the_whole_review(tmp_path: Path) -> None:
+def test_nested_symlink_outside_root_is_opaque_during_review(tmp_path: Path) -> None:
     root = tmp_path / "allowed"
     folder = root / "folder"
     folder.mkdir(parents=True)
-    outside = tmp_path / "outside"
-    outside.mkdir()
-    (folder / "escape").symlink_to(outside, target_is_directory=True)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"external target" * 8192)
+    (folder / "escape").symlink_to(outside)
 
-    with pytest.raises(UnsafePathError, match="Symlink escapa"):
-        build_review([folder], allowed_root=root)
+    review = build_review([folder], allowed_root=root, active_paths=())
+    trash = FakeTrash()
+    result = ItemExecutor(MemoryHistory(), trash=trash, active_paths=()).execute_one(
+        review, folder
+    )
+
+    assert result.success
+    assert trash.paths == [folder]
+    assert review.items[0].size_bytes < outside.stat().st_blocks * 512
+    assert outside.read_bytes() == b"external target" * 8192
 
 
 def test_revalidation_rejects_symlink_swap_after_review(tmp_path: Path) -> None:
@@ -327,12 +335,14 @@ def test_review_warns_when_item_owner_differs(tmp_path: Path, monkeypatch) -> No
     assert any("pertence ao UID" in warning for warning in review.items[0].warnings)
 
 
-def test_permanent_delete_removes_tree_without_following_internal_symlink(tmp_path: Path) -> None:
+def test_permanent_delete_unlinks_external_symlink_without_following_target(
+    tmp_path: Path,
+) -> None:
     root = tmp_path / "allowed"
     folder = root / "folder"
     folder.mkdir(parents=True)
     (folder / "file").write_bytes(b"inside")
-    outside = root / "outside"
+    outside = tmp_path / "outside"
     outside.write_bytes(b"keep")
     (folder / "link").symlink_to(outside)
     review = build_review([folder], allowed_root=root)
@@ -436,6 +446,31 @@ def test_active_application_is_a_distinct_review_block(tmp_path: Path) -> None:
     assert not result.success
     assert result.record["failure_kind"] == "application_in_use"
     assert "Visual Studio Code" in result.record["failure_message"]
+
+
+def test_active_application_cwd_ancestor_does_not_block_every_descendant(
+    tmp_path: Path,
+) -> None:
+    root, target = make_target(tmp_path)
+    active = ActiveProcessPath(root, "Hyprland")
+
+    review = build_review([target], allowed_root=root, active_paths=(active,))
+
+    assert review.items[0].path == target.resolve()
+
+
+def test_active_application_path_inside_selected_folder_still_blocks(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "allowed"
+    target = root / "folder"
+    target.mkdir(parents=True)
+    open_file = target / "open-file.txt"
+    open_file.write_text("in use", encoding="utf-8")
+    active = ActiveProcessPath(open_file, "Editor")
+
+    with pytest.raises(ActiveApplicationError, match="Editor.*open-file.txt"):
+        build_review([target], allowed_root=root, active_paths=(active,))
 
 
 def test_outside_scan_root_has_distinct_classification(tmp_path: Path) -> None:

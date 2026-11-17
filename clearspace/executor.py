@@ -251,6 +251,9 @@ class ItemExecutor:
         action: FileAction = FileAction.TRASH,
         *,
         user_data_confirmed: bool = False,
+        permanent_confirmed: bool = False,
+        # Kept for existing non-UI callers; the UI uses one explicit batch
+        # confirmation and no longer asks users to type a phrase.
         typed_confirmation: str | None = None,
     ) -> ItemResult:
         """Execute exactly one item after its review and confirmation."""
@@ -282,9 +285,10 @@ class ItemExecutor:
             if item.risk is Risk.USER_DATA and not user_data_confirmed:
                 raise UnsafePathError("Dados pessoais exigem confirmação reforçada")
             if action is FileAction.PERMANENT:
-                if typed_confirmation != PERMANENT_CONFIRMATION:
+                if not permanent_confirmed and typed_confirmation != PERMANENT_CONFIRMATION:
                     raise UnsafePathError(
-                        f'Digite exatamente "{PERMANENT_CONFIRMATION}" para confirmar'
+                        f'Confirme explicitamente a exclusão permanente '
+                        f'(compatibilidade: "{PERMANENT_CONFIRMATION}")'
                     )
             if item.risk is Risk.CRITICAL:
                 raise UnsafePathError("Exclusão permanente bloqueada para risco crítico")
@@ -296,6 +300,7 @@ class ItemExecutor:
                 _validate_path(checked_path, review.allowed_root, active_paths)
                 self.trash(checked_path)
             elif action is FileAction.PERMANENT:
+                # The rooted walk checks each entry immediately before removal.
                 _permanent_remove(checked_path, review.allowed_root, active_paths)
             else:
                 raise ValueError(f"Ação desconhecida: {action}")
@@ -480,9 +485,11 @@ def _validate_path(
 
 
 def _validate_nested_links(path: Path, root: Path, root_device: int,
-                           active_paths: tuple[Path, ...]) -> None:
+                           active_paths: tuple[Path | ActiveProcessPath, ...],
+                           guard: _PathGuard | None = None) -> None:
     if not path.is_dir():
         return
+    guard = guard or _PathGuard.from_active_paths(active_paths)
     try:
         with os.scandir(path) as entries:
             children = list(entries)
@@ -501,16 +508,12 @@ def _validate_nested_links(path: Path, root: Path, root_device: int,
         if info.st_dev != root_device:
             raise UnsafePathError(f"Subdiretório em outro filesystem: {child}")
         if stat.S_ISLNK(info.st_mode):
-            try:
-                target = child.resolve(strict=False)
-                target.relative_to(root)
-            except (OSError, ValueError) as error:
-                raise UnsafePathError(f"Symlink escapa da raiz permitida: {child}") from error
-            if _is_protected(target, root, active_paths):
-                raise UnsafePathError(f"Symlink aponta para dado protegido: {child}")
-        elif stat.S_ISDIR(info.st_mode):
-            _validate_nested_links(child, root, root_device, active_paths)
-        if _is_protected(child, root, active_paths):
+            # Treat links inside a selected directory as opaque entries. Sizing
+            # and removal operate on the link itself and never follow its target.
+            continue
+        if stat.S_ISDIR(info.st_mode):
+            _validate_nested_links(child, root, root_device, active_paths, guard)
+        if guard.blocks(child, root):
             raise UnsafePathError(f"Árvore inclui dado protegido/ativo: {child}")
 
 
@@ -556,11 +559,17 @@ def _tree_allocated_size(
     return total
 
 
-def _permanent_remove(path: Path, root: Path, active_paths: tuple[Path, ...]) -> None:
+def _permanent_remove(
+    path: Path, root: Path, active_paths: tuple[Path | ActiveProcessPath, ...]
+) -> None:
     """Delete through directory descriptors, never resolving symlink entries."""
     relative = path.relative_to(root)
+    root_device = root.stat().st_dev
+    guard = _PathGuard.from_active_paths(active_paths)
     root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     try:
+        if os.fstat(root_fd).st_dev != root_device:
+            raise UnsafePathError(f"Filesystem da raiz mudou durante exclusão: {root}")
         parent_fd = os.dup(root_fd)
         try:
             for component in relative.parts[:-1]:
@@ -568,8 +577,12 @@ def _permanent_remove(path: Path, root: Path, active_paths: tuple[Path, ...]) ->
                                   dir_fd=parent_fd)
                 os.close(parent_fd)
                 parent_fd = next_fd
+                if os.fstat(parent_fd).st_dev != root_device:
+                    raise UnsafePathError(
+                        f"Filesystem diferente durante exclusão: {root / component}"
+                    )
             name = relative.parts[-1]
-            _remove_entry_at(parent_fd, name, root, path, active_paths, root.stat().st_dev)
+            _remove_entry_at(parent_fd, name, root, path, root_device, guard)
         finally:
             os.close(parent_fd)
     finally:
@@ -577,33 +590,33 @@ def _permanent_remove(path: Path, root: Path, active_paths: tuple[Path, ...]) ->
 
 
 def _remove_entry_at(parent_fd: int, name: str, root: Path, path: Path,
-                     active_paths: tuple[Path, ...], root_device: int) -> None:
+                     root_device: int, guard: _PathGuard) -> None:
     full_path = path
     info = os.stat(name, dir_fd=parent_fd, follow_symlinks=False)
     if info.st_dev != root_device:
         raise UnsafePathError(f"Filesystem diferente durante exclusão: {full_path}")
     if stat.S_ISLNK(info.st_mode):
-        parent = full_path.parent
-        _validate_path(parent, root, active_paths)
-        link_target = os.readlink(name, dir_fd=parent_fd)
-        resolved_target = (parent / link_target).resolve(strict=False)
-        if not _is_below(resolved_target, root) or _is_protected(
-            resolved_target, root, active_paths
-        ):
-            raise UnsafePathError(f"Symlink agora aponta para fora/área protegida: {full_path}")
-        # Unlink only the directory entry. No operation opens or follows target.
+        # The parent directory descriptor is rooted below the allowed root.
+        # Unlink only this directory entry; never resolve or open its target.
         os.unlink(name, dir_fd=parent_fd)
         return
-    _validate_path(full_path, root, active_paths)
+    if guard.blocks(
+        full_path, root, canonicalize=stat.S_ISDIR(info.st_mode)
+    ):
+        raise UnsafePathError(f"Caminho protegido/ativo durante exclusão: {full_path}")
+    if not stat.S_ISDIR(info.st_mode) and not stat.S_ISREG(info.st_mode):
+        raise UnsafePathError(f"Tipo de arquivo protegido: {full_path}")
     if stat.S_ISDIR(info.st_mode):
         child_fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
                            dir_fd=parent_fd)
         try:
+            if os.fstat(child_fd).st_dev != root_device:
+                raise UnsafePathError(f"Filesystem diferente durante exclusão: {full_path}")
             with os.scandir(child_fd) as entries:
                 names = [entry.name for entry in entries]
             for child_name in names:
                 _remove_entry_at(child_fd, child_name, root, full_path / child_name,
-                                 active_paths, root_device)
+                                 root_device, guard)
         finally:
             os.close(child_fd)
         os.rmdir(name, dir_fd=parent_fd)
@@ -613,28 +626,51 @@ def _remove_entry_at(parent_fd: int, name: str, root: Path, path: Path,
         raise UnsafePathError(f"Tipo de arquivo protegido: {full_path}")
 
 
-def _is_protected(path: Path, root: Path,
-                  active_paths: tuple[Path | ActiveProcessPath, ...]) -> bool:
-    resolved = path.resolve(strict=False)
-    if _protected_rule_match(resolved):
-        return True
-    for active in active_paths:
-        if isinstance(active, ActiveProcessPath):
-            continue
-        active_resolved = active.resolve(strict=False)
-        if _is_below(resolved, active_resolved) or _is_below(active_resolved, resolved):
-            return True
-    try:
-        resolved.relative_to(root)
-    except ValueError:
-        return True
-    return False
+@dataclass(frozen=True)
+class _PathGuard:
+    protected_roots: tuple[Path, ...]
+    active_paths: tuple[Path, ...]
+
+    @classmethod
+    def from_active_paths(
+        cls, active_paths: tuple[Path | ActiveProcessPath, ...]
+    ) -> _PathGuard:
+        protected_roots = tuple(path for _rule, path in _protected_roots())
+        resolved_active = tuple(
+            path.resolve(strict=False)
+            for path in active_paths
+            if not isinstance(path, ActiveProcessPath)
+        )
+        return cls(protected_roots, resolved_active)
+
+    def blocks(self, path: Path, root: Path, *, canonicalize: bool = True) -> bool:
+        resolved = path.resolve(strict=False) if canonicalize else path
+        for protected_root in self.protected_roots:
+            if protected_root == Path("/"):
+                if resolved == protected_root:
+                    return True
+            elif _is_below(resolved, protected_root):
+                return True
+        for active_path in self.active_paths:
+            if _is_below(resolved, active_path) or _is_below(active_path, resolved):
+                return True
+        return not _is_below(resolved, root)
 
 
 def _protected_rule_match(path: Path) -> tuple[str, Path] | None:
     resolved = path.resolve(strict=False)
+    for rule, protected_root in _protected_roots():
+        if protected_root == Path("/"):
+            if resolved == protected_root:
+                return rule, protected_root
+        elif _is_below(resolved, protected_root):
+            return rule, protected_root
+    return None
+
+
+def _protected_roots() -> tuple[tuple[str, Path], ...]:
     home = Path.home().resolve(strict=False)
-    exact_roots = [
+    roots = [
         (f"system root {value}", Path(value).resolve(strict=False))
         for value in SYSTEM_PROTECTED
     ]
@@ -654,14 +690,8 @@ def _protected_rule_match(path: Path) -> tuple[str, Path] | None:
         (".config/gcloud", "Google Cloud credentials"),
         (".local/share/keyrings", "desktop keyring"),
     ):
-        exact_roots.append((rule, home / relative))
-    for rule, protected_root in exact_roots:
-        if protected_root == Path("/"):
-            if resolved == protected_root:
-                return rule, protected_root
-        elif _is_below(resolved, protected_root):
-            return rule, protected_root
-    return None
+        roots.append((rule, home / relative))
+    return tuple(roots)
 
 
 def _active_application_match(
@@ -672,7 +702,11 @@ def _active_application_match(
         if not isinstance(active, ActiveProcessPath):
             continue
         active_path = active.path.resolve(strict=False)
-        if _is_below(path, active_path) or _is_below(active_path, path):
+        # A process cwd is often a broad directory (for example, a compositor
+        # started from $HOME). It does not mean every descendant is in use.
+        # Block the selected path when it is the active path or contains a
+        # specific active file/directory, but not when it is merely below it.
+        if path == active_path or _is_below(active_path, path):
             return active
     return None
 

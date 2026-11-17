@@ -48,7 +48,6 @@ from clearspace.progress import (
 )
 from clearspace.executor import (
     ActiveApplicationError,
-    PERMANENT_CONFIRMATION,
     CleanupReview,
     FileAction,
     ItemExecutor,
@@ -127,10 +126,9 @@ class Clearspace(Gtk.Application):
         self.entries: dict[Path, TreeEntry] = {}
         self.inspection_only_roots: tuple[Path, ...] = ()
         self.check_buttons: dict[Path, list[Gtk.CheckButton]] = {}
-        self._syncing_checks = False
+        self._syncing_checks = 0
         self._review: CleanupReview | None = None
         self._review_action: FileAction | None = None
-        self._review_index = 0
         self._execution_results = []
         self._workflow_busy = False
         self._scan_generation = 0
@@ -216,11 +214,11 @@ class Clearspace(Gtk.Application):
         self.panes = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL, vexpand=True)
         outer.append(self.panes)
 
-        tree_scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
-        tree_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        self.panes.set_start_child(tree_scroll)
+        self.tree_scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        self.tree_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        self.panes.set_start_child(self.tree_scroll)
         self.tree_placeholder = Gtk.Label(label="Loading folder…", xalign=0)
-        tree_scroll.set_child(self.tree_placeholder)
+        self.tree_scroll.set_child(self.tree_placeholder)
 
         self.details = self._build_details_panel()
         self.panes.set_end_child(self.details)
@@ -1424,6 +1422,9 @@ class Clearspace(Gtk.Application):
         self.tree_selection.connect("notify::selected-item", self._selected_item_changed)
         self.tree_view = Gtk.ColumnView.new(self.tree_selection)
         self.tree_view.connect("map", self._tree_mapped)
+        # GTK's RTL column resize math reverses horizontal drag direction.
+        # Append in reverse so the visible left-to-right order stays unchanged.
+        self.tree_view.set_direction(Gtk.TextDirection.RTL)
         self.tree_view.set_show_row_separators(True)
         self.tree_view.set_show_column_separators(False)
         self.tree_view.set_tab_behavior(Gtk.ListTabBehavior.CELL)
@@ -1431,16 +1432,18 @@ class Clearspace(Gtk.Application):
         key_controller = Gtk.EventControllerKey()
         key_controller.connect("key-pressed", self._tree_key_pressed)
         self.tree_view.add_controller(key_controller)
-        self.tree_view.append_column(self._checkbox_column())
+        columns = [self._checkbox_column()]
         name_column = self._name_column()
         name_column.set_expand(True)
-        self.tree_view.append_column(name_column)
-        self.tree_view.append_column(self._usage_column())
-        self.tree_view.append_column(self._size_column())
-        self.tree_view.append_column(self._risk_column())
-        parent = self.tree_placeholder.get_parent()
-        if parent:
-            parent.set_child(self.tree_view)
+        columns.extend((
+            name_column,
+            self._usage_column(),
+            self._size_column(),
+            self._risk_column(),
+        ))
+        for column in reversed(columns):
+            self.tree_view.append_column(column)
+        self.tree_scroll.set_child(self.tree_view)
         root_row = tree_model.get_row(0)
         if root_row:
             root_row.set_expanded(True)
@@ -1460,6 +1463,15 @@ class Clearspace(Gtk.Application):
         return GLib.SOURCE_REMOVE
 
     def _tree_mapped(self, _tree_view):
+        header = _tree_view.get_first_child()
+        title = header.get_first_child() if header else None
+        while title:
+            title_box = title.get_first_child()
+            title_label = title_box.get_first_child() if title_box else None
+            if title_label and isinstance(title_label, Gtk.Label):
+                title_label.set_hexpand(True)
+                title_label.set_xalign(0.5)
+            title = title.get_next_sibling()
         if hasattr(self, "scan_report") and self._scan_started_at:
             self.scan_report["time_to_tree_mapped_seconds"] = round(
                 time.monotonic() - self._scan_started_at, 3
@@ -1833,15 +1845,19 @@ class Clearspace(Gtk.Application):
         factory.connect("unbind", self._checkbox_unbind)
         column = Gtk.ColumnViewColumn.new("Selecionar", factory)
         column.set_fixed_width(112)
+        column.set_resizable(True)
         return column
 
     def _checkbox_setup(self, _factory, list_item):
         checkbox = Gtk.CheckButton()
+        checkbox.set_halign(Gtk.Align.CENTER)
         checkbox.connect("toggled", self._checkbox_toggled)
         list_item.set_child(checkbox)
 
     def _checkbox_bind(self, _factory, list_item):
         checkbox = list_item.get_child()
+        old_entry = getattr(checkbox, "_clearspace_entry", None)
+        self._unregister_checkbox(checkbox, old_entry)
         tree_row = list_item.get_item()
         entry = tree_row.get_item()
         checkbox._clearspace_entry = entry
@@ -1854,10 +1870,17 @@ class Clearspace(Gtk.Application):
     def _checkbox_unbind(self, _factory, list_item):
         checkbox = list_item.get_child()
         entry = getattr(checkbox, "_clearspace_entry", None)
-        if entry and entry.node.path in self.check_buttons:
-            buttons = self.check_buttons[entry.node.path]
-            if checkbox in buttons:
-                buttons.remove(checkbox)
+        self._unregister_checkbox(checkbox, entry)
+        checkbox._clearspace_entry = None
+
+    def _unregister_checkbox(self, checkbox, entry):
+        if entry is None:
+            return
+        buttons = self.check_buttons.get(entry.node.path)
+        if buttons and checkbox in buttons:
+            buttons.remove(checkbox)
+            if not buttons:
+                self.check_buttons.pop(entry.node.path, None)
 
     def _set_checkbox_state(self, checkbox, entry):
         if not self.selection or not entry.node.selectable:
@@ -1865,10 +1888,12 @@ class Clearspace(Gtk.Application):
             checkbox.set_inconsistent(False)
             return
         state = self.selection.state(entry.node)
-        self._syncing_checks = True
-        checkbox.set_active(state is SelectionState.CHECKED)
-        checkbox.set_inconsistent(state is SelectionState.PARTIAL)
-        self._syncing_checks = False
+        self._syncing_checks += 1
+        try:
+            checkbox.set_active(state is SelectionState.CHECKED)
+            checkbox.set_inconsistent(state is SelectionState.PARTIAL)
+        finally:
+            self._syncing_checks -= 1
 
     def _checkbox_toggled(self, checkbox):
         if self._syncing_checks or not self.selection:
@@ -1893,13 +1918,14 @@ class Clearspace(Gtk.Application):
         factory.connect("bind", self._name_bind)
         factory.connect("unbind", self._name_unbind)
         column = Gtk.ColumnViewColumn.new("Arquivo ou pasta", factory)
+        column.set_resizable(True)
         return column
 
     def _name_setup(self, _factory, list_item):
         expander = Gtk.TreeExpander()
         box = Gtk.Box(spacing=8)
         icon = Gtk.Image()
-        label = Gtk.Label(xalign=0, hexpand=True, ellipsize=3)
+        label = Gtk.Label(xalign=0.5, hexpand=True, ellipsize=3)
         more_button = Gtk.Button(label="Show more")
         more_button.set_visible(False)
         more_button.add_css_class("flat")
@@ -1976,27 +2002,39 @@ class Clearspace(Gtk.Application):
         factory.connect("bind", self._usage_bind)
         column = Gtk.ColumnViewColumn.new("Relative usage", factory)
         column.set_fixed_width(145)
+        column.set_resizable(True)
         return column
 
     def _usage_setup(self, _factory, list_item):
-        progress = Gtk.ProgressBar(hexpand=True)
-        progress.set_size_request(95, 8)
-        list_item.set_child(progress)
+        box = Gtk.Box(spacing=6)
+        box.set_halign(Gtk.Align.CENTER)
+        progress = Gtk.ProgressBar(show_text=False)
+        progress.set_size_request(75, 8)
+        label = Gtk.Label(xalign=0.5)
+        label.set_width_chars(4)
+        box.append(progress)
+        box.append(label)
+        list_item.set_child(box)
 
     def _usage_bind(self, _factory, list_item):
         entry = list_item.get_item().get_item()
-        progress = list_item.get_child()
-        if entry.parent_entry:
-            siblings = entry.parent_entry.node.children
-        else:
-            siblings = (self.root_node,) if self.root_node else ()
-        max_size = max((node.size_bytes for node in siblings), default=1)
+        box = list_item.get_child()
+        progress = box.get_first_child()
+        label = progress.get_next_sibling()
+        # Scanner pages are sorted by size, so the parent aggregate is the
+        # largest sibling even when that sibling is not loaded in this page.
+        max_size = (
+            entry.parent_entry.node.child_size_bytes
+            if entry.parent_entry
+            else entry.node.size_bytes
+        )
         max_size = max(1, max_size)
         fraction = relative_size_fraction(entry.node.size_bytes, max_size)
         progress.set_fraction(fraction)
+        label.set_text(f"{fraction:.0%}")
         self._set_accessible_label(
             progress,
-            f"{entry.node.name}: {fraction:.0%} of largest sibling",
+            f"{entry.node.name}: {fraction:.0%} of parent usage",
         )
 
     def _size_column(self):
@@ -2005,12 +2043,13 @@ class Clearspace(Gtk.Application):
         factory.connect("bind", self._size_bind)
         column = Gtk.ColumnViewColumn.new("Size", factory)
         column.set_fixed_width(110)
+        column.set_resizable(True)
         return column
 
     def _size_setup(self, _factory, list_item):
         detail = Gtk.Label(xalign=1)
         detail.set_width_chars(12)
-        detail.set_xalign(1.0)
+        detail.set_xalign(0.5)
         detail.add_css_class("size-value")
         list_item.set_child(detail)
 
@@ -2035,11 +2074,13 @@ class Clearspace(Gtk.Application):
         factory.connect("bind", self._risk_bind)
         column = Gtk.ColumnViewColumn.new("Risco", factory)
         column.set_fixed_width(150)
+        column.set_resizable(True)
         return column
 
     def _risk_setup(self, _factory, list_item):
-        label = Gtk.Label(xalign=0)
+        label = Gtk.Label(xalign=0.5)
         label.add_css_class("badge")
+        label.set_halign(Gtk.Align.CENTER)
         list_item.set_child(label)
 
     def _risk_bind(self, _factory, list_item):
@@ -2271,32 +2312,72 @@ class Clearspace(Gtk.Application):
                 return GLib.SOURCE_REMOVE
             self._show_message("Revisão bloqueada", error or "Não foi possível revisar a seleção.")
             return GLib.SOURCE_REMOVE
+        ordered_items = tuple(sorted(
+            review.items,
+            key=lambda item: (
+                -self._risk_rank(item.risk), -item.size_bytes, str(item.path)
+            ),
+        ))
+        review = replace(review, items=ordered_items)
         self._review = review
         self._execution_results = []
         lines = []
         for item in review.items:
+            blocked = " · BLOQUEADO: risco crítico" if item.risk is Risk.CRITICAL else ""
             lines.append(
-                f"• {item.path}\n  {format_bytes(item.size_bytes)} · risco {item.risk.value}"
+                f"• {item.path}\n  {format_bytes(item.size_bytes)} · risco {item.risk.value}{blocked}"
             )
             lines.extend(f"  Aviso: {warning}" for warning in item.warnings)
+            if item.trash_supported is False:
+                command = "rm -r -- " + shlex.quote(str(item.path))
+                lines.append(f"  Comando para uso por conta própria: {command}")
         detail = (
             "\n".join(lines)
             + f"\n\nTotal estimado: {format_bytes(review.total_size_bytes)}"
             + f"\nRisco máximo: {review.maximum_risk.value}"
             + f"\n\n{review.notice}"
         )
-        dialog = Gtk.AlertDialog()
-        dialog.set_message("Revise cada item antes de confirmar")
-        dialog.set_detail(detail)
-        if review.maximum_risk is Risk.CRITICAL:
-            self._set_workflow_busy(False)
-            dialog.set_buttons(["Fechar · risco crítico bloqueia a ação"])
-            dialog.choose(self.window, None, self._critical_review_closed, None)
-        else:
-            dialog.set_buttons(["Cancelar", "Mover para lixeira", "Excluir permanentemente"])
-            dialog.set_cancel_button(0)
-            dialog.set_default_button(0)
-            dialog.choose(self.window, None, self._review_response, review)
+        dialog = Gtk.Dialog(title="Revisar lote de limpeza", transient_for=self.window, modal=True)
+        dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
+        trash_button = dialog.add_button(
+            "Mover itens permitidos para a lixeira", Gtk.ResponseType.APPLY
+        )
+        permanent_button = dialog.add_button(
+            "Excluir itens permitidos permanentemente", Gtk.ResponseType.ACCEPT
+        )
+        content = dialog.get_content_area()
+        content.append(Gtk.Label(
+            label="Confira todos os itens. A ordem é risco decrescente e depois tamanho.",
+            xalign=0,
+            wrap=True,
+        ))
+        listing = Gtk.Label(label=detail, xalign=0, yalign=0, wrap=True, selectable=True)
+        listing.set_margin_top(8)
+        listing.set_margin_bottom(8)
+        listing.set_margin_start(8)
+        listing.set_margin_end(8)
+        scroller = Gtk.ScrolledWindow(min_content_height=360, min_content_width=720)
+        scroller.set_child(listing)
+        content.append(scroller)
+        has_user_data = any(item.risk is Risk.USER_DATA for item in review.items)
+        if has_user_data:
+            acknowledge = Gtk.CheckButton(
+                label="Entendo que itens marcados como dados pessoais podem conter conteúdo importante"
+            )
+            acknowledge.set_active(False)
+            trash_button.set_sensitive(False)
+            permanent_button.set_sensitive(False)
+
+            def update_batch_buttons(check):
+                enabled = check.get_active()
+                trash_button.set_sensitive(enabled)
+                permanent_button.set_sensitive(enabled)
+
+            acknowledge.connect("toggled", update_batch_buttons)
+            content.append(acknowledge)
+        dialog.set_default_response(Gtk.ResponseType.CANCEL)
+        dialog.connect("response", self._review_response, review)
+        dialog.present()
         return GLib.SOURCE_REMOVE
 
     def _active_application_review_response(self, dialog, result, _data):
@@ -2307,198 +2388,91 @@ class Clearspace(Gtk.Application):
         if choice == 0:
             self.review_selection(None)
 
-    def _critical_review_closed(self, dialog, result, _data):
-        try:
-            dialog.choose_finish(result)
-        except GLib.Error:
-            pass
-
     def _review_response(self, dialog, result, review):
-        try:
-            choice = dialog.choose_finish(result)
-        except GLib.Error:
-            return
-        if choice not in (1, 2):
+        dialog.destroy()
+        if result not in (Gtk.ResponseType.APPLY, Gtk.ResponseType.ACCEPT):
             self._cancel_review_plan()
             return
         self._review = review
-        self._review_action = FileAction.TRASH if choice == 1 else FileAction.PERMANENT
-        if self._review_action is FileAction.PERMANENT and any(
-            item.risk is Risk.CRITICAL for item in review.items
-        ):
+        self._review_action = (
+            FileAction.TRASH
+            if result == Gtk.ResponseType.APPLY
+            else FileAction.PERMANENT
+        )
+        executable_items = tuple(
+            item for item in review.items if item.risk is not Risk.CRITICAL
+        )
+        if not executable_items:
             self._cancel_review_plan()
-            self._show_message("Ação bloqueada", "Exclusão permanente bloqueada para risco crítico.")
-            return
-        self._review_index = 0
-        self._confirm_next_item()
-
-    def _confirm_next_item(self):
-        review = self._review
-        action = self._review_action
-        if not review or not action:
-            return
-        if self._review_index >= len(review.items):
-            self._show_message("Revisão concluída", "Todas as ações confirmadas terminaram.")
-            self.scan()
-            return
-        item = review.items[self._review_index]
-        if item.risk is Risk.CRITICAL:
-            self._show_message("Ação bloqueada", f"Risco crítico: {item.path}")
-            self._cancel_review_plan()
-            return
-        if item.risk is Risk.USER_DATA:
-            dialog = Gtk.AlertDialog()
-            dialog.set_message("Confirmação reforçada · dados pessoais")
-            dialog.set_detail(
-                f"Este item pode conter dados pessoais:\n{item.path}\n\n"
-                "Confirme que revisou o aviso e deseja continuar."
+            self._show_message(
+                "Ação bloqueada", "Todos os itens selecionados têm risco crítico."
             )
-            dialog.set_buttons(["Cancelar plano", "Entendo e quero continuar"])
-            dialog.set_cancel_button(0)
-            dialog.choose(self.window, None, self._user_data_response, item)
-        else:
-            self._ask_item_confirmation(item)
+            return
 
-    def _user_data_response(self, dialog, result, item):
-        try:
-            choice = dialog.choose_finish(result)
-        except GLib.Error:
-            return
-        if choice != 1:
-            self._cancel_review_plan()
-            return
-        self._ask_item_confirmation(item, user_data_confirmed=True)
-
-    def _ask_item_confirmation(self, item: ReviewedItem, *, user_data_confirmed=False):
-        action = self._review_action
-        if action is FileAction.TRASH and item.trash_supported is False:
-            self._ask_unavailable_trash_confirmation(item, user_data_confirmed)
-            return
-        action_label = "Mover para lixeira" if action is FileAction.TRASH else "Excluir permanentemente"
-        dialog = Gtk.AlertDialog()
-        dialog.set_message(f"Confirmar item {self._review_index + 1} de {len(self._review.items)}")
-        dialog.set_detail(
-            f"{item.path}\n{format_bytes(item.size_bytes)} · risco {item.risk.value}\n\n"
-            f"Ação: {action_label}"
+        user_data_confirmed = any(
+            item.risk is Risk.USER_DATA for item in review.items
         )
-        dialog.set_buttons(["Cancelar plano", action_label])
-        dialog.set_cancel_button(0)
-        dialog.set_default_button(0)
-        callback = self._permanent_item_response if action is FileAction.PERMANENT else self._trash_item_response
-        dialog.choose(self.window, None, callback, (item, user_data_confirmed))
-
-    def _ask_unavailable_trash_confirmation(self, item, user_data_confirmed):
-        dialog = Gtk.Dialog(title="Lixeira indisponível", transient_for=self.window, modal=True)
-        dialog.add_button("Cancelar plano", Gtk.ResponseType.CANCEL)
-        dialog.add_button("Continuar sem este item", Gtk.ResponseType.APPLY)
-        dialog.add_button("Excluir permanentemente", Gtk.ResponseType.ACCEPT)
-        content = dialog.get_content_area()
-        content.append(Gtk.Label(
-            label=f"Este local não tem lixeira (partição diferente do home)\n{item.path}",
-            xalign=0, wrap=True,
-        ))
-        option = Gtk.CheckButton(label="Excluir permanentemente")
-        option.set_active(False)
-        content.append(option)
-        command = "rm -r -- " + shlex.quote(str(item.path))
-        content.append(Gtk.Label(label=f"Comando equivalente (para uso por conta própria):\n{command}",
-                                 xalign=0, wrap=True, selectable=True))
-        dialog.connect("response", self._unavailable_trash_response,
-                       item, user_data_confirmed, option)
-        dialog.present()
-
-    def _unavailable_trash_response(self, dialog, response, item, user_data_confirmed, option):
-        selected = option.get_active()
-        dialog.destroy()
-        if response == Gtk.ResponseType.CANCEL:
-            self._cancel_review_plan()
-        elif response == Gtk.ResponseType.ACCEPT and selected:
-            self._typed_confirmation_dialog(item, user_data_confirmed)
-        else:
-            result = ItemExecutor(self.history, active_paths=()).record_skip(self._review, item)
-            self._item_finished(result)
-
-    def _trash_item_response(self, dialog, result, state):
-        try:
-            choice = dialog.choose_finish(result)
-        except GLib.Error:
-            return
-        if choice != 1:
-            self._cancel_review_plan()
-            return
-        item, user_data_confirmed = state
-        self._execute_item(item, FileAction.TRASH, user_data_confirmed, None)
-
-    def _permanent_item_response(self, dialog, result, state):
-        try:
-            choice = dialog.choose_finish(result)
-        except GLib.Error:
-            return
-        if choice != 1:
-            self._cancel_review_plan()
-            return
-        item, user_data_confirmed = state
-        self._typed_confirmation_dialog(item, user_data_confirmed)
-
-    def _typed_confirmation_dialog(self, item, user_data_confirmed):
-        dialog = Gtk.Dialog(title="Confirmação de exclusão permanente", transient_for=self.window,
-                            modal=True)
-        dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
-        dialog.add_button("Excluir permanentemente", Gtk.ResponseType.ACCEPT)
-        content = dialog.get_content_area()
-        prompt = Gtk.Label(
-            label=f"Digite {PERMANENT_CONFIRMATION} para excluir:\n{item.path}",
-            xalign=0,
-            wrap=True,
-        )
-        content.append(prompt)
-        entry = Gtk.Entry()
-        entry.set_placeholder_text(PERMANENT_CONFIRMATION)
-        content.append(entry)
-        dialog.connect("response", self._typed_confirmation_response,
-                       item, user_data_confirmed, entry)
-        dialog.present()
-
-    def _typed_confirmation_response(self, dialog, response, item, user_data_confirmed, entry):
-        typed = entry.get_text()
-        dialog.destroy()
-        if response != Gtk.ResponseType.ACCEPT:
-            self._cancel_review_plan()
-            return
-        self._execute_item(item, FileAction.PERMANENT, user_data_confirmed, typed)
-
-    def _execute_item(self, item, action, user_data_confirmed, typed_confirmation):
         self._set_workflow_busy(True)
-        self.disk_label.set_text(f"Executando uma ação: {item.path.name}…")
-        scan_root = self._review.allowed_root
+        self._execution_results = []
+        self.disk_label.set_text("Executando lote; cada item será validado e registrado…")
+        threading.Thread(
+            target=self._execute_review_batch,
+            args=(review, self._review_action, user_data_confirmed),
+            name="clearspace-cleanup-batch",
+            daemon=True,
+        ).start()
+
+    def _execute_review_batch(self, review, action, user_data_confirmed):
+        scan_root = review.allowed_root
         executor = ItemExecutor(
             self.history,
             active_paths=lambda: discover_active_paths(scan_root)
             + self.inspection_only_roots,
         )
-        threading.Thread(
-            target=self._execute_worker,
-            args=(executor, self._review, item, action, user_data_confirmed, typed_confirmation),
-            daemon=True,
-        ).start()
+        results = []
+        eligible = tuple(item for item in review.items if item.risk is not Risk.CRITICAL)
+        for index, item in enumerate(eligible, start=1):
+            GLib.idle_add(
+                self._batch_item_progress,
+                index,
+                len(eligible),
+                item.path,
+            )
+            results.append(executor.execute_one(
+                review,
+                item.path,
+                action,
+                user_data_confirmed=user_data_confirmed,
+                permanent_confirmed=action is FileAction.PERMANENT,
+            ))
+        for item in review.items:
+            if item.risk is Risk.CRITICAL:
+                results.append(executor.execute_one(
+                    review,
+                    item.path,
+                    action,
+                    user_data_confirmed=False,
+                    permanent_confirmed=False,
+                ))
+        ordered_results = tuple(sorted(
+            results,
+            key=lambda result: (
+                -self._risk_rank(next(
+                    item.risk for item in review.items if item.path == result.path
+                )),
+                -next(item.size_bytes for item in review.items if item.path == result.path),
+                str(result.path),
+            ),
+        ))
+        GLib.idle_add(self._batch_execution_finished, ordered_results)
 
-    def _execute_worker(self, executor, review, item, action, user_data_confirmed, typed):
-        result = executor.execute_one(
-            review,
-            item.path,
-            action,
-            user_data_confirmed=user_data_confirmed,
-            typed_confirmation=typed,
-        )
-        GLib.idle_add(self._item_finished, result)
+    def _batch_item_progress(self, index, total, path):
+        self.disk_label.set_text(f"Executando item {index} de {total}: {path.name}…")
+        return GLib.SOURCE_REMOVE
 
-    def _item_finished(self, result):
-        self._execution_results.append(result)
-        self._review_index += 1
-        if self._review_index >= len(self._review.items):
-            self._show_execution_summary()
-            return GLib.SOURCE_REMOVE
-        self._confirm_next_item()
+    def _batch_execution_finished(self, results):
+        self._execution_results = list(results)
+        self._show_execution_summary()
         return GLib.SOURCE_REMOVE
 
     def _show_execution_summary(self):
@@ -2508,6 +2482,8 @@ class Clearspace(Gtk.Application):
         verb = "movidos" if self._review_action is FileAction.TRASH else "excluídos"
         dialog = Gtk.Dialog(title="Resumo da execução", transient_for=self.window, modal=True)
         dialog.add_button("Fechar", Gtk.ResponseType.CLOSE)
+        rescan_button = dialog.add_button("Reanalisar agora", Gtk.ResponseType.APPLY)
+        rescan_button.add_css_class("suggested-action")
         content = dialog.get_content_area()
         content.append(Gtk.Label(label=f"{succeeded} {verb}, {failed} falharam", xalign=0))
         if self._review_action is FileAction.TRASH:
@@ -2546,13 +2522,22 @@ class Clearspace(Gtk.Application):
     def _copy_failed_path(self, _button, path):
         self.window.get_display().get_clipboard().set(path)
 
-    def _execution_summary_closed(self, dialog, _response):
+    def _execution_summary_closed(self, dialog, response):
         dialog.destroy()
+        review = self._review
         self._review = None
         self._review_action = None
         self._execution_results = []
         self._set_workflow_busy(False)
-        self.scan()
+        if response == Gtk.ResponseType.APPLY and review is not None:
+            self.scan(review.allowed_root)
+            return
+        self.disk_label.set_text(
+            "Resultados desatualizados após a limpeza. Reanalise antes de selecionar itens."
+        )
+        if hasattr(self, "tree_view"):
+            self.tree_view.set_sensitive(False)
+        self.review_button.set_sensitive(False)
 
     @staticmethod
     def _free_space_text(record):
