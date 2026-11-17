@@ -38,7 +38,7 @@ def test_selection_states_and_minimal_paths(tmp_path: Path) -> None:
     selection.set_checked(folder, True)
     assert selection.selected_paths == (folder.path,)
     assert selection.estimated_size_bytes == 30
-    assert selection.state(file_node) is SelectionState.UNCHECKED
+    assert selection.state(file_node) is SelectionState.CHECKED
 
     selection.set_checked(root, True)
     assert selection.selected_paths == (root.path,)
@@ -53,6 +53,28 @@ def test_unchecking_parent_clears_selected_descendants(tmp_path: Path) -> None:
 
     assert selection.state(folder) is SelectionState.UNCHECKED
     assert selection.selected_paths == ()
+
+
+def test_unchecking_subtree_removes_nested_selection_without_clearing_siblings(
+    tmp_path: Path,
+) -> None:
+    root_path = tmp_path / "root"
+    folder_path = root_path / "folder"
+    nested_path = folder_path / "nested"
+    selected_node = Node(nested_path / "item", "item", False, 10)
+    nested = Node(nested_path, "nested", True, 10, children=[selected_node])
+    folder = Node(folder_path, "folder", True, 10, children=[nested])
+    sibling = Node(root_path / "sibling", "sibling", False, 5)
+    root = Node(root_path, "root", True, 25, children=[folder, sibling])
+    selection = SelectionModel([root])
+    selection.set_checked(selected_node, True)
+    selection.set_checked(sibling, True)
+
+    selection.set_checked(folder, False)
+
+    assert selection.state(folder) is SelectionState.UNCHECKED
+    assert selection.selected_paths == (sibling.path,)
+    assert selection.estimated_size_bytes == sibling.size_bytes
 
 
 def test_procedure_availability_and_admin_copy_only(monkeypatch: pytest.MonkeyPatch) -> None:

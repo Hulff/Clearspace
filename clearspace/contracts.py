@@ -55,7 +55,7 @@ class SelectionModel:
     _sizes: dict[Path, int] = field(default_factory=dict, repr=False)
 
     def set_checked(self, node: Node, checked: bool) -> None:
-        """Set a node's selection, clearing descendants when checking it."""
+        """Set a node's selection and clear covered paths when it is unchecked."""
         if not node.selectable:
             return
         if checked:
@@ -72,14 +72,15 @@ class SelectionModel:
             }
             self._sizes[node.path] = node.size_bytes
         else:
-            ancestors = [path for path in self._checked if _is_at_or_below(node.path, path)]
-            if ancestors:
-                for path in ancestors:
-                    self._checked.discard(path)
-                    self._sizes.pop(path, None)
-            else:
-                self._checked.discard(node.path)
-                self._sizes.pop(node.path, None)
+            covered_paths = {
+                path
+                for path in self._checked
+                if _is_at_or_below(path, node.path)
+                or _is_at_or_below(node.path, path)
+            }
+            self._checked.difference_update(covered_paths)
+            for path in covered_paths:
+                self._sizes.pop(path, None)
 
     def state(self, node: Node) -> SelectionState:
         if any(_is_at_or_below(node.path, path) for path in self._checked):

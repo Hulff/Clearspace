@@ -42,6 +42,7 @@ from clearspace.progress import (
     format_size_gib,
     filesystem_stats,
     progress_percent,
+    relative_size_fraction,
 )
 from clearspace.executor import (
     ActiveApplicationError,
@@ -258,6 +259,7 @@ class Clearspace(Gtk.Application):
         .scan-card { padding: 22px; }
         .scan-stat { padding: 14px; }
         .scan-muted { color: #a9b0b3; }
+        .size-value { font-family: monospace; font-variant-numeric: tabular-nums; }
         .scan-accent { color: #5aa9ff; }
         progressbar trough { min-height: 14px; border-radius: 8px; background: #34383a; }
         progressbar progress { min-height: 14px; border-radius: 8px; background: #5aa9ff; }
@@ -349,7 +351,22 @@ class Clearspace(Gtk.Application):
         biggest_title = Gtk.Label(label="Biggest so far", xalign=0)
         biggest_title.add_css_class("heading")
         card.append(biggest_title)
-        self.scan_biggest_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=7)
+        self.scan_biggest_box = Gtk.Grid(column_spacing=12, row_spacing=7)
+        self.scan_biggest_box.set_hexpand(True)
+        self._scan_biggest_rows = []
+        for row_index in range(4):
+            name_label = Gtk.Label(xalign=0, hexpand=True, ellipsize=3)
+            bar = Gtk.ProgressBar()
+            bar.set_size_request(160, 8)
+            size_label = Gtk.Label(xalign=1)
+            size_label.set_width_chars(10)
+            size_label.set_xalign(1.0)
+            size_label.add_css_class("size-value")
+            size_label.add_css_class("scan-muted")
+            self.scan_biggest_box.attach(name_label, 0, row_index, 1, 1)
+            self.scan_biggest_box.attach(bar, 1, row_index, 1, 1)
+            self.scan_biggest_box.attach(size_label, 2, row_index, 1, 1)
+            self._scan_biggest_rows.append((name_label, bar, size_label))
         card.append(self.scan_biggest_box)
 
         controls = Gtk.Box(spacing=10)
@@ -1305,26 +1322,22 @@ class Clearspace(Gtk.Application):
             self.scan_pause_button.set_label("Pause")
 
     def _render_biggest_so_far(self):
-        child = self.scan_biggest_box.get_first_child()
-        while child is not None:
-            self.scan_biggest_box.remove(child)
-            child = self.scan_biggest_box.get_first_child()
         largest = self._scan_largest_items
-        maximum = max((size for _name, _path, size in largest), default=1)
-        for name, path, size in largest:
-            row = Gtk.Box(spacing=10)
-            label = Gtk.Label(label=name, xalign=0, hexpand=True, ellipsize=3)
-            label.set_tooltip_text(path)
-            row.append(label)
-            bar = Gtk.ProgressBar()
-            bar.set_size_request(110, 8)
-            bar.set_fraction(min(1.0, size / maximum))
+        maximum = max((size for _name, _path, size in largest), default=0)
+        for row_index, row_widgets in enumerate(self._scan_biggest_rows):
+            name_label, bar, size_label = row_widgets
+            if row_index >= len(largest):
+                for widget in row_widgets:
+                    widget.set_visible(False)
+                continue
+            name, path, size = largest[row_index]
+            name_label.set_text(name)
+            name_label.set_tooltip_text(path)
+            bar.set_fraction(relative_size_fraction(size, maximum))
             self._set_accessible_label(bar, f"{name} size")
-            row.append(bar)
-            amount = Gtk.Label(label=format_bytes(size), xalign=1)
-            amount.add_css_class("scan-muted")
-            row.append(amount)
-            self.scan_biggest_box.append(row)
+            size_label.set_text(format_bytes(size))
+            for widget in row_widgets:
+                widget.set_visible(True)
 
     def _toggle_scan_pause(self, _button):
         event = self.scan_controller.latest_snapshot()
@@ -1951,7 +1964,7 @@ class Clearspace(Gtk.Application):
             siblings = (self.root_node,) if self.root_node else ()
         max_size = max((node.size_bytes for node in siblings), default=1)
         max_size = max(1, max_size)
-        fraction = min(1.0, entry.node.size_bytes / max_size)
+        fraction = relative_size_fraction(entry.node.size_bytes, max_size)
         progress.set_fraction(fraction)
         self._set_accessible_label(
             progress,
@@ -1969,6 +1982,8 @@ class Clearspace(Gtk.Application):
     def _size_setup(self, _factory, list_item):
         detail = Gtk.Label(xalign=1)
         detail.set_width_chars(12)
+        detail.set_xalign(1.0)
+        detail.add_css_class("size-value")
         list_item.set_child(detail)
 
     def _size_bind(self, _factory, list_item):

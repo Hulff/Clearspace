@@ -101,6 +101,7 @@ class ScanController:
         self._result: object | None = None
         self._error: BaseException | None = None
         self._started_at = 0.0
+        self._terminal = False
 
     def start(self, task: ScanTask[T]) -> None:
         with self._lock:
@@ -111,6 +112,7 @@ class ScanController:
             self._pause.set()
             self._result = None
             self._error = None
+            self._terminal = False
             self._started_at = time.monotonic()
             self._snapshot = ProgressEvent(state=ScanState.RUNNING)
             self._thread = threading.Thread(
@@ -119,24 +121,57 @@ class ScanController:
             self._thread.start()
 
     def _run(self, task: ScanTask[T]) -> None:
+        completed = False
         try:
             self._result = task(self.publish, self._cancel, self._pause)
-            current = self.latest_snapshot()
-            if self._cancel.is_set():
-                final = replace(current, state=ScanState.CANCELLED, partial=True)
-            else:
-                final = replace(current, state=ScanState.DONE, partial=current.partial)
-            self.publish(final)
+            completed = True
         except BaseException as error:
             self._error = error
-            current = self.latest_snapshot()
-            self.publish(replace(current, state=ScanState.ERROR, partial=True))
+        finally:
+            with self._lock:
+                current = self._snapshot
+                if self._error is not None:
+                    state = ScanState.ERROR
+                    partial = True
+                elif self._cancel.is_set():
+                    state = ScanState.CANCELLED
+                    partial = True
+                elif completed:
+                    state = ScanState.DONE
+                    partial = current.partial
+                else:
+                    state = ScanState.ERROR
+                    partial = True
+                try:
+                    self._snapshot = replace(
+                        current,
+                        state=state,
+                        partial=partial,
+                        elapsed_ms=max(
+                            current.elapsed_ms,
+                            int((time.monotonic() - self._started_at) * 1000),
+                        ),
+                    )
+                except BaseException as error:
+                    if self._error is None:
+                        self._error = error
+                    self._snapshot = ProgressEvent(
+                        state=ScanState.ERROR,
+                        partial=True,
+                        elapsed_ms=max(
+                            0,
+                            int((time.monotonic() - self._started_at) * 1000),
+                        ),
+                    )
+                self._terminal = True
 
     def publish(self, event: ProgressEvent) -> None:
         """Publish a scanner snapshot, filling elapsed time if it was omitted."""
         if event.elapsed_ms == 0 and self._started_at:
             event = replace(event, elapsed_ms=int((time.monotonic() - self._started_at) * 1000))
         with self._lock:
+            if self._terminal:
+                return
             self._snapshot = event
 
     def pause(self) -> None:
@@ -208,6 +243,13 @@ def progress_percent(
     if event.state is not ScanState.DONE:
         return min(99, percent)
     return percent
+
+
+def relative_size_fraction(size_bytes: int, largest_size_bytes: int) -> float:
+    """Return a bounded usage-bar fraction relative to the largest entry."""
+    if largest_size_bytes <= 0:
+        return 0.0
+    return min(1.0, max(0.0, size_bytes / largest_size_bytes))
 
 
 class EtaEstimator:

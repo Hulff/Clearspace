@@ -117,6 +117,60 @@ def test_scan_controller_pause_resume_cancel_keeps_partial_result() -> None:
     assert snapshot.partial
 
 
+def test_scan_controller_terminal_snapshot_cannot_be_overwritten_by_racing_pause() -> None:
+    controller = ScanController()
+    task_started = threading.Event()
+    finish_task = threading.Event()
+    pause_publish_waiting = threading.Event()
+    release_pause_publish = threading.Event()
+    original_publish = controller.publish
+
+    def gate_pause_publish(event: ProgressEvent) -> None:
+        if event.state is ScanState.PAUSED:
+            pause_publish_waiting.set()
+            assert release_pause_publish.wait(timeout=1)
+        original_publish(event)
+
+    controller.publish = gate_pause_publish
+
+    def fake_scanner(_publish, _cancel_event, _pause_event):
+        task_started.set()
+        assert finish_task.wait(timeout=1)
+        return "completed inventory"
+
+    controller.start(fake_scanner)
+    assert task_started.wait(timeout=1)
+    pause_thread = threading.Thread(target=controller.pause)
+    pause_thread.start()
+    assert pause_publish_waiting.wait(timeout=1)
+
+    finish_task.set()
+    scan_thread = controller._thread
+    assert scan_thread is not None
+    scan_thread.join(timeout=1)
+    assert controller.latest_snapshot().state is ScanState.DONE
+    release_pause_publish.set()
+    pause_thread.join(timeout=1)
+
+    assert controller.latest_snapshot().state is ScanState.DONE
+
+
+def test_scan_controller_publishes_error_terminal_state_when_task_raises() -> None:
+    controller = ScanController()
+
+    def failing_scanner(_publish, _cancel_event, _pause_event):
+        raise OSError("synthetic scan failure")
+
+    controller.start(failing_scanner)
+    thread = controller._thread
+    assert thread is not None
+    thread.join(timeout=1)
+
+    assert controller.latest_snapshot().state is ScanState.ERROR
+    assert controller.latest_snapshot().partial
+    assert isinstance(controller.error, OSError)
+    assert str(controller.error) == "synthetic scan failure"
+
 def test_progress_formatting() -> None:
     assert format_size_gib(1024**3) == "1.0 GiB"
     assert format_elapsed(65_999) == "1:05"
@@ -202,6 +256,21 @@ def test_progress_event_can_expose_statvfs_failure() -> None:
     assert hasattr(event, "filesystem_error"), "statvfs errors must remain visible"
     event = ProgressEvent(filesystem_error="statvfs denied")
     assert event.filesystem_error == "statvfs denied"
+
+
+def test_relative_size_fraction_scales_to_largest_with_zero_and_single_edges() -> None:
+    fraction = getattr(progress_module, "relative_size_fraction", None)
+    assert callable(fraction), "relative_size_fraction must be provided for usage bars"
+
+    largest = int(1.8 * 1024**3)
+    assert fraction(largest, largest) == 1.0
+    assert fraction(int(587.9 * 1024**2), largest) == pytest.approx(
+        int(587.9 * 1024**2) / largest
+    )
+    assert fraction(12 * 1024, largest) == pytest.approx(12 * 1024 / largest)
+    assert fraction(0, largest) == 0.0
+    assert fraction(42, 42) == 1.0
+    assert fraction(0, 0) == 0.0
 
 
 def _required_filesystem_stats():
