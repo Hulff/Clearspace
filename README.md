@@ -65,7 +65,10 @@ Clearspace stores a structured, local JSONL action history at `~/.local/share/cl
   symlinks before acting. The review warns about likely ownership or parent-permission
   failures. Each attempt records its result and error category in JSONL; failures do not
   stop later confirmed items, and the final summary offers a copy-path button per failure.
-  Gio reports unsupported trash filesystems separately from permission failures.
+  Gio reports unsupported trash filesystems separately from permission failures. Protected
+  system, home-root, credential, and editor-user paths use canonical component checks;
+  known regenerable caches remain selectable. If a process is using an item, the review
+  names it and offers a retry after it is closed.
 - Cleanup runs one native command at a time, with a confirmation dialog showing the command and expected impact.
 - Data-bearing targets such as Trash, Docker volumes, browser profiles, model downloads, and project directories are inspection-only.
 - The app does not invoke a shell or request administrator privileges.

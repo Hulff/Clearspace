@@ -25,6 +25,8 @@ class RuleEvaluation:
 RULES: tuple[Rule, ...] = (
     Rule(RuleMatcher(MatcherKind.CATEGORY, "regenerable_cache"), Risk.LOW,
          "Cache regenerável; a aplicação pode precisar reconstruí-lo."),
+    Rule(RuleMatcher(MatcherKind.NAME, "vscode-cpptools"), Risk.MODERATE,
+         "Feche o VS Code; os índices serão recriados."),
     Rule(RuleMatcher(MatcherKind.NAME, "go-build"), Risk.LOW,
          "Use o comando nativo do Go para limpar este cache.", "go-build-cache"),
     Rule(RuleMatcher(MatcherKind.NAME, "node_modules"), Risk.MODERATE,

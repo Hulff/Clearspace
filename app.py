@@ -42,6 +42,7 @@ from clearspace.progress import (
     progress_percent,
 )
 from clearspace.executor import (
+    ActiveApplicationError,
     PERMANENT_CONFIRMATION,
     CleanupReview,
     FileAction,
@@ -2160,15 +2161,27 @@ class Clearspace(Gtk.Application):
                 trash_support=gio_trash_supported,
             )
             error = None
+        except ActiveApplicationError as exc:
+            review = None
+            error = exc
         except Exception as exc:
             review = None
             error = str(exc)
         GLib.idle_add(self._show_review, review, error)
 
-    def _show_review(self, review: CleanupReview | None, error: str | None):
+    def _show_review(self, review: CleanupReview | None, error: str | Exception | None):
         self._refresh_selection_summary()
         if error or review is None:
             self._set_workflow_busy(False)
+            if isinstance(error, ActiveApplicationError):
+                dialog = Gtk.AlertDialog()
+                dialog.set_message("Aplicação em uso")
+                dialog.set_detail(str(error))
+                dialog.set_buttons(["Fechar e tentar novamente", "Cancelar"])
+                dialog.set_cancel_button(1)
+                dialog.set_default_button(1)
+                dialog.choose(self.window, None, self._active_application_review_response, None)
+                return GLib.SOURCE_REMOVE
             self._show_message("Revisão bloqueada", error or "Não foi possível revisar a seleção.")
             return GLib.SOURCE_REMOVE
         self._review = review
@@ -2198,6 +2211,14 @@ class Clearspace(Gtk.Application):
             dialog.set_default_button(0)
             dialog.choose(self.window, None, self._review_response, review)
         return GLib.SOURCE_REMOVE
+
+    def _active_application_review_response(self, dialog, result, _data):
+        try:
+            choice = dialog.choose_finish(result)
+        except GLib.Error:
+            return
+        if choice == 0:
+            self.review_selection(None)
 
     def _critical_review_closed(self, dialog, result, _data):
         try:
@@ -2413,6 +2434,8 @@ class Clearspace(Gtk.Application):
             kind = record.get("failure_kind")
             messages = {
                 "app_protected": "Bloqueado pelas proteções do Clearspace",
+                "application_in_use": "Aplicação em uso; feche e tente novamente",
+                "outside_scan_root": "Caminho fora da raiz do scan",
                 "filesystem_permission": "Sem permissão do sistema de arquivos",
                 "trash_unavailable": "Lixeira indisponível neste filesystem",
                 "missing": "O item não existe mais",

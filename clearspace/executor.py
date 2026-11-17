@@ -64,7 +64,7 @@ class CleanupReview:
     items: tuple[ReviewedItem, ...]
     total_size_bytes: int
     maximum_risk: Risk
-    active_paths: tuple[Path, ...] = ()
+    active_paths: tuple[Path | ActiveProcessPath, ...] = ()
     notice: str = TRASH_NOTICE
 
 
@@ -78,6 +78,24 @@ class ItemResult:
 
 class UnsafePathError(ValueError):
     """Raised when a selected path violates filesystem safety rules."""
+
+
+class ActiveApplicationError(UnsafePathError):
+    """Raised when a selected path is currently used by an application."""
+
+
+class ProtectedPathError(UnsafePathError):
+    """Raised when an explicit protected-root rule matches a path."""
+
+
+class OutsideScanRootError(UnsafePathError):
+    """Raised when a canonical path is outside the selected scan root."""
+
+
+@dataclass(frozen=True, slots=True)
+class ActiveProcessPath:
+    path: Path
+    application: str
 
 
 def build_review(
@@ -122,10 +140,15 @@ def build_review(
         raise ValueError("Selecione ao menos um item para revisar")
     max_risk = max((item.risk for item in items), key=_risk_rank)
     return CleanupReview(root, tuple(items), sum(item.size_bytes for item in items), max_risk,
-                         tuple(Path(path).resolve(strict=False) for path in active_paths))
+                         tuple(
+                             ActiveProcessPath(path.path.resolve(strict=False), path.application)
+                             if isinstance(path, ActiveProcessPath)
+                             else Path(path).resolve(strict=False)
+                             for path in active_paths
+                         ))
 
 
-def discover_active_paths(allowed_root: Path) -> tuple[Path, ...]:
+def discover_active_paths(allowed_root: Path) -> tuple[ActiveProcessPath, ...]:
     """Find open files and working directories under a scan root via procfs.
 
     This reads link targets only; it never opens application files. Call again
@@ -133,7 +156,7 @@ def discover_active_paths(allowed_root: Path) -> tuple[Path, ...]:
     """
     root = allowed_root.resolve(strict=True)
     proc = Path("/proc")
-    active: set[Path] = set()
+    active: set[ActiveProcessPath] = set()
     try:
         processes = tuple(proc.iterdir())
     except OSError as error:
@@ -164,6 +187,11 @@ def discover_active_paths(allowed_root: Path) -> tuple[Path, ...]:
             raise RuntimeError(f"UID inválido no processo {process.name}") from error
         if os.getuid() not in process_uids and os.geteuid() not in process_uids:
             continue
+        try:
+            comm = (process / "comm").read_text(encoding="utf-8").strip()
+        except OSError:
+            comm = "Aplicativo"
+        application = _application_label(comm)
         sources = [process / "cwd"]
         try:
             sources.extend((process / "fd").iterdir())
@@ -198,8 +226,8 @@ def discover_active_paths(allowed_root: Path) -> tuple[Path, ...]:
                 canonical.relative_to(root)
             except (OSError, ValueError):
                 continue
-            active.add(canonical)
-    return tuple(sorted(active))
+            active.add(ActiveProcessPath(canonical, application))
+    return tuple(sorted(active, key=lambda item: (str(item.path), item.application)))
 
 
 class ItemExecutor:
@@ -353,15 +381,19 @@ def _canonical_root(root: Path) -> Path:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
         raise UnsafePathError("A raiz permitida deve ser um diretório real, sem symlink")
     canonical = root.resolve(strict=True)
-    if _is_protected(canonical, canonical, ()):
-        raise UnsafePathError(f"Raiz protegida: {canonical}")
+    match = _protected_rule_match(canonical)
+    if match:
+        rule, protected_path = match
+        raise ProtectedPathError(
+            f"Caminho protegido (raiz protegida) pela regra '{rule}': {protected_path}"
+        )
     return canonical
 
 
 def _validate_path(
     candidate: Path,
     root: Path,
-    active_paths: tuple[Path, ...],
+    active_paths: tuple[Path | ActiveProcessPath, ...],
 ) -> tuple[Path, os.stat_result]:
     if ".." in candidate.parts:
         raise UnsafePathError(f"Caminho com '..' bloqueado: {candidate}")
@@ -369,7 +401,9 @@ def _validate_path(
     try:
         lexical.relative_to(root)
     except ValueError as error:
-        raise UnsafePathError(f"Caminho fora da raiz permitida: {candidate}") from error
+        raise OutsideScanRootError(
+            f"Caminho fora da raiz do scan: {candidate} (raiz: {root})"
+        ) from error
     if lexical == root:
         raise UnsafePathError("A raiz permitida não pode ser alterada")
 
@@ -384,6 +418,22 @@ def _validate_path(
                 raise
             raise UnsafePathError(f"Caminho não pode ser validado: {error}") from error
         if stat.S_ISLNK(info.st_mode):
+            try:
+                canonical_link_target = current.resolve(strict=True)
+            except OSError as error:
+                raise UnsafePathError(f"Symlink não pode ser canonicalizado: {current}") from error
+            if not _is_below(canonical_link_target, root):
+                raise OutsideScanRootError(
+                    f"Symlink aponta para fora da raiz do scan: {current} "
+                    f"(destino: {canonical_link_target}; raiz: {root})"
+                )
+            protected_match = _protected_rule_match(canonical_link_target)
+            if protected_match:
+                rule, protected_path = protected_match
+                raise ProtectedPathError(
+                    f"Caminho protegido pela regra '{rule}': {protected_path} "
+                    f"(via symlink {current})"
+                )
             raise UnsafePathError(f"Symlink bloqueado: {current}")
 
     try:
@@ -394,8 +444,27 @@ def _validate_path(
         if isinstance(error, (PermissionError, FileNotFoundError)):
             raise
         raise UnsafePathError(f"Caminho escapou da raiz ou não existe: {candidate}") from error
-    if _is_protected(canonical, root, active_paths):
-        raise UnsafePathError(f"Caminho protegido: {canonical}")
+    match = _protected_rule_match(canonical)
+    if match:
+        rule, protected_path = match
+        raise ProtectedPathError(
+            f"Caminho protegido (raiz protegida) pela regra '{rule}': {protected_path}"
+        )
+    active_application = _active_application_match(canonical, active_paths)
+    if active_application is not None:
+        raise ActiveApplicationError(
+            f"Aplicação em uso: {active_application.application} está usando "
+            f"{active_application.path}. Feche o aplicativo e tente novamente."
+        )
+    active_path = _active_path_match(canonical, active_paths)
+    if active_path is not None:
+        raise UnsafePathError(f"Caminho protegido/ativo: {active_path}")
+    try:
+        canonical.relative_to(root)
+    except ValueError as error:
+        raise OutsideScanRootError(
+            f"Caminho fora da raiz do scan: {canonical} (raiz: {root})"
+        ) from error
     root_device = root.stat().st_dev
     if info.st_dev != root_device:
         raise UnsafePathError("Caminho está em outro filesystem")
@@ -539,17 +608,14 @@ def _remove_entry_at(parent_fd: int, name: str, root: Path, path: Path,
         raise UnsafePathError(f"Tipo de arquivo protegido: {full_path}")
 
 
-def _is_protected(path: Path, root: Path, active_paths: tuple[Path, ...]) -> bool:
+def _is_protected(path: Path, root: Path,
+                  active_paths: tuple[Path | ActiveProcessPath, ...]) -> bool:
     resolved = path.resolve(strict=False)
-    protected = [Path(value).resolve(strict=False) for value in SYSTEM_PROTECTED]
-    protected_home = Path.home().resolve(strict=False)
-    for protected_root in protected:
-        if (resolved == protected_root if protected_root == Path("/")
-                else _is_below(resolved, protected_root)):
-            return True
-    if resolved == protected_home:
+    if _protected_rule_match(resolved):
         return True
     for active in active_paths:
+        if isinstance(active, ActiveProcessPath):
+            continue
         active_resolved = active.resolve(strict=False)
         if _is_below(resolved, active_resolved) or _is_below(active_resolved, resolved):
             return True
@@ -558,6 +624,73 @@ def _is_protected(path: Path, root: Path, active_paths: tuple[Path, ...]) -> boo
     except ValueError:
         return True
     return False
+
+
+def _protected_rule_match(path: Path) -> tuple[str, Path] | None:
+    resolved = path.resolve(strict=False)
+    home = Path.home().resolve(strict=False)
+    exact_roots = [
+        (f"system root {value}", Path(value).resolve(strict=False))
+        for value in SYSTEM_PROTECTED
+    ]
+    exact_roots.append(("home directory", home))
+    for relative, rule in (
+        (".ssh", "SSH credentials"),
+        (".gnupg", "GPG credentials"),
+        (".aws", "cloud credentials"),
+        (".azure", "Azure credentials"),
+        (".kube", "Kubernetes credentials"),
+        (".docker/config.json", "Docker credentials"),
+        (".git-credentials", "Git credentials"),
+        (".netrc", "netrc credentials"),
+        (".npmrc", "npm credentials"),
+        (".pypirc", "PyPI credentials"),
+        (".config/Code/User", "VS Code user data"),
+        (".config/credentials", "user credentials"),
+        (".config/gcloud", "Google Cloud credentials"),
+        (".local/share/keyrings", "desktop keyring"),
+    ):
+        exact_roots.append((rule, home / relative))
+    for rule, protected_root in exact_roots:
+        if protected_root == Path("/"):
+            if resolved == protected_root:
+                return rule, protected_root
+        elif rule == "home directory":
+            if resolved == protected_root:
+                return rule, protected_root
+        elif _is_below(resolved, protected_root):
+            return rule, protected_root
+    return None
+
+
+def _active_application_match(
+    path: Path,
+    active_paths: tuple[Path | ActiveProcessPath, ...],
+) -> ActiveProcessPath | None:
+    for active in active_paths:
+        if not isinstance(active, ActiveProcessPath):
+            continue
+        active_path = active.path.resolve(strict=False)
+        if _is_below(path, active_path) or _is_below(active_path, path):
+            return active
+    return None
+
+
+def _active_path_match(path: Path, active_paths: tuple[Path | ActiveProcessPath, ...]) -> Path | None:
+    for active in active_paths:
+        if isinstance(active, ActiveProcessPath):
+            continue
+        active_path = active.resolve(strict=False)
+        if _is_below(path, active_path) or _is_below(active_path, path):
+            return active_path
+    return None
+
+
+def _application_label(comm: str) -> str:
+    normalized = comm.casefold()
+    if normalized in {"code", "code-oss", "code-insiders", "codium"}:
+        return "Visual Studio Code"
+    return comm or "Aplicativo"
 
 
 def _permission_warnings(path: Path, info: os.stat_result) -> tuple[str, ...]:
@@ -585,6 +718,12 @@ def _permission_warnings(path: Path, info: os.stat_result) -> tuple[str, ...]:
 
 
 def _error_kind(error: Exception) -> str:
+    if isinstance(error, ActiveApplicationError):
+        return "application_in_use"
+    if isinstance(error, OutsideScanRootError):
+        return "outside_scan_root"
+    if isinstance(error, ProtectedPathError):
+        return "app_protected"
     if isinstance(error, UnsafePathError):
         return "app_protected"
     if isinstance(error, FileNotFoundError):
@@ -606,7 +745,9 @@ def _error_kind(error: Exception) -> str:
 
 def _failure_message(kind: str | None, details: str | None) -> str | None:
     messages = {
-        "app_protected": "Item bloqueado pelas proteções do Clearspace.",
+        "app_protected": "Item protegido pelo Clearspace.",
+        "application_in_use": "Aplicação em uso; feche o aplicativo e tente novamente.",
+        "outside_scan_root": "Caminho fora da raiz do scan.",
         "filesystem_permission": "Sem permissão do sistema de arquivos.",
         "trash_unavailable": "A lixeira não está disponível neste filesystem.",
         "missing": "O item não existe mais.",

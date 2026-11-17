@@ -5,16 +5,22 @@ from pathlib import Path
 
 import pytest
 
-from clearspace.contracts import Risk
+from clearspace.contracts import Node, Risk
 from clearspace.core import Candidate, History, execute_cleanup
 from clearspace.executor import (
+    ActiveApplicationError,
+    ActiveProcessPath,
+    OutsideScanRootError,
     PERMANENT_CONFIRMATION,
     FileAction,
     ItemExecutor,
     UnsafePathError,
     build_review,
+    _error_kind,
+    _protected_rule_match,
 )
 import clearspace.executor as executor_module
+from clearspace.rules import RuleEngine
 
 
 class MemoryHistory:
@@ -151,7 +157,8 @@ def test_revalidation_rejects_symlink_swap_after_review(tmp_path: Path) -> None:
     result = ItemExecutor(MemoryHistory(), trash=trash).execute_one(review, target)
 
     assert not result.success
-    assert "Symlink bloqueado" in result.record["failure_details"]
+    assert "Symlink aponta para fora da raiz do scan" in result.record["failure_details"]
+    assert result.record["failure_kind"] == "outside_scan_root"
     assert trash.paths == []
     assert external.read_bytes() == b"outside"
 
@@ -354,3 +361,82 @@ def test_legacy_command_cleanup_is_blocked_and_logged(tmp_path: Path, monkeypatc
     assert record["action"] == "blocked_legacy_command"
     assert "desativada" in record["failure_details"]
     assert finished == [record]
+
+
+def test_explicit_protected_roots_and_registry_caches(tmp_path: Path, monkeypatch) -> None:
+    home = tmp_path / "fake-home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    for protected in (
+        Path("/"), Path("/usr"), home, home / ".ssh", home / ".gnupg",
+        home / ".config/Code/User",
+    ):
+        assert _protected_rule_match(protected) is not None
+    assert _protected_rule_match(Path("/usr/share")) is not None
+    assert _protected_rule_match(home / ".config/Code/User/settings.json") is not None
+
+    cache_root = home / ".cache"
+    vscode_cache = cache_root / "vscode-cpptools"
+    vscode_cache.mkdir(parents=True)
+    (vscode_cache / "index.db").write_bytes(b"index")
+    review = build_review([vscode_cache], allowed_root=cache_root, active_paths=())
+    assert review.items[0].path == vscode_cache.resolve()
+    result = RuleEngine().evaluate(Node(vscode_cache, vscode_cache.name, True, 5))
+    assert "Feche o VS Code; os índices serão recriados." in result.warnings
+    assert result.risk is Risk.MODERATE
+
+    go_cache = cache_root / "go-build"
+    go_cache.mkdir()
+    assert _protected_rule_match(go_cache) is None
+
+
+def test_active_application_is_a_distinct_review_block(tmp_path: Path) -> None:
+    root, target = make_target(tmp_path)
+    active = ActiveProcessPath(target, "Visual Studio Code")
+    with pytest.raises(
+        ActiveApplicationError,
+        match="Visual Studio Code.*Feche.*tente novamente",
+    ) as exc:
+        build_review([target], allowed_root=root, active_paths=(active,))
+    assert _error_kind(exc.value) == "application_in_use"
+
+    review = build_review([target], allowed_root=root, active_paths=())
+    result = ItemExecutor(MemoryHistory(), active_paths=(active,)).execute_one(review, target)
+    assert not result.success
+    assert result.record["failure_kind"] == "application_in_use"
+    assert "Visual Studio Code" in result.record["failure_message"]
+
+
+def test_outside_scan_root_has_distinct_classification(tmp_path: Path) -> None:
+    root, _target = make_target(tmp_path)
+    outside = tmp_path / "outside.bin"
+    outside.write_bytes(b"outside")
+    with pytest.raises(OutsideScanRootError, match="fora da raiz do scan") as exc:
+        build_review([outside], allowed_root=root, active_paths=())
+    assert _error_kind(exc.value) == "outside_scan_root"
+
+
+def test_protected_comparison_canonicalizes_symlink_target_and_rejects_parent_hops(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setenv("HOME", str(home))
+    ssh = home / ".ssh"
+    ssh.mkdir()
+    alias = tmp_path / "ssh-alias"
+    alias.symlink_to(ssh, target_is_directory=True)
+    assert _protected_rule_match(alias / "id_ed25519") == (
+        "SSH credentials", ssh.resolve()
+    )
+
+    root, target = make_target(tmp_path)
+    with pytest.raises(UnsafePathError, match="'..'"):
+        build_review([root / "sub" / ".." / target.name], allowed_root=root, active_paths=())
+
+    external = tmp_path / "external"
+    external.write_text("outside", encoding="utf-8")
+    escape = root / "escape"
+    escape.symlink_to(external)
+    with pytest.raises(OutsideScanRootError, match="Symlink aponta para fora"):
+        build_review([escape], allowed_root=root, active_paths=())
