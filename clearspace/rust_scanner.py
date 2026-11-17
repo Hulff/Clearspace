@@ -13,7 +13,7 @@ from contextlib import closing
 from pathlib import Path
 from typing import Callable
 
-from .contracts import Node
+from .contracts import Node, parse_scan_error_kind
 from .progress import ProgressEvent, ScanState
 
 
@@ -44,6 +44,9 @@ def progress_event_from_rust(
         if type(value) is not int or value < 0:
             raise ValueError(f"Rust progress event has invalid {key}")
         values[key] = value
+    unreadable_count = event.get("unreadable_count", values["errors"])
+    if type(unreadable_count) is not int or unreadable_count < 0:
+        raise ValueError("Rust progress event has invalid unreadable_count")
     if values["dirs_done"] + values["dirs_queued"] != values["dirs_total_est"]:
         raise ValueError("Rust progress directory estimate is inconsistent")
     current_path = event.get("current_path")
@@ -78,6 +81,7 @@ def progress_event_from_rust(
         state=ScanState.RUNNING,
         partial=values["errors"] > 0,
         largest_items=tuple(largest_items),
+        unreadable_count=unreadable_count,
     )
 
 
@@ -93,6 +97,7 @@ class RustTreeScanner:
         exclusions: tuple[Path, ...] = (),
         include_hidden: bool = True,
         stay_on_device: bool = True,
+        state_changed: Callable[[], None] | None = None,
     ) -> None:
         self.root_path = Path(root_path)
         self.max_visible_children = max_visible_children
@@ -100,6 +105,7 @@ class RustTreeScanner:
         if self.binary is None:
             raise RustScannerError("clearspace-scan binary was not found")
         self.progress = progress
+        self.state_changed = state_changed
         cache_root: Path | None
         if cache_dir is not None:
             cache_root = cache_dir
@@ -188,6 +194,7 @@ class RustTreeScanner:
                 "dirs_total_est",
                 "files",
                 "errors",
+                "unreadable_count",
                 "allocated_bytes",
             )
         }
@@ -200,12 +207,16 @@ class RustTreeScanner:
                     raise RustScannerError("scan cancelled")
                 if pause_event is not None and not pause_event.is_set():
                     process.send_signal(signal.SIGSTOP)
+                    if self.state_changed:
+                        self.state_changed()
                     while not pause_event.wait(timeout=0.1):
                         if cancel_event is not None and cancel_event.is_set():
                             process.terminate()
                             process.wait()
                             raise RustScannerError("scan cancelled")
                     process.send_signal(signal.SIGCONT)
+                    if self.state_changed:
+                        self.state_changed()
                 try:
                     event = json.loads(line)
                 except json.JSONDecodeError as error:
@@ -229,7 +240,10 @@ class RustTreeScanner:
                     except ValueError as error:
                         raise RustScannerError(str(error)) from error
                     for key in previous_progress:
-                        value = event.get(key)
+                        value = event.get(
+                            key,
+                            event.get("errors", 0) if key == "unreadable_count" else None,
+                        )
                         if not isinstance(value, int) or value < previous_progress[key]:
                             raise RustScannerError(f"scanner progress has invalid {key}")
                         previous_progress[key] = value
@@ -258,13 +272,14 @@ class RustTreeScanner:
 
         self._validate_completion(terminal)
         self.report = {
-            key: terminal[key]
+            key: terminal.get(key, terminal.get("errors", 0))
             for key in (
                 "nodes",
                 "directories",
                 "dirs_done",
                 "files",
                 "errors",
+                "unreadable_count",
                 "symlinks_skipped",
                 "other_filesystems_skipped",
                 "allocated_bytes",
@@ -287,6 +302,7 @@ class RustTreeScanner:
             True,
             row[0] * 512,
             error=row[2],
+            error_kind=parse_scan_error_kind(row[2]),
             children_loaded=False,
             size_is_partial=bool(row[3]),
             selectable=False,
@@ -303,6 +319,7 @@ class RustTreeScanner:
             "directories",
             "files",
             "errors",
+            "unreadable_count",
             "symlinks_skipped",
             "other_filesystems_skipped",
             "allocated_bytes",
@@ -312,7 +329,8 @@ class RustTreeScanner:
             "duration_ms",
         )
         for key in required:
-            if type(event.get(key)) is not int or event[key] < 0:
+            value = event.get(key, event.get("errors", 0) if key == "unreadable_count" else None)
+            if type(value) is not int or value < 0:
                 raise RustScannerError(f"completed event has invalid {key}")
         if event["dirs_queued"] != 0 or event["dirs_done"] != event["dirs_total_est"]:
             raise RustScannerError("completed event has inconsistent directory estimate")
@@ -358,6 +376,7 @@ class RustTreeScanner:
                 bool(is_dir),
                 size_blocks * 512,
                 error=error,
+                error_kind=parse_scan_error_kind(error),
                 children_loaded=not bool(is_dir),
                 size_is_partial=bool(partial),
                 selectable=error is None,
@@ -422,6 +441,7 @@ class RustTreeScanner:
                 bool(is_dir),
                 size_blocks * 512,
                 error=error,
+                error_kind=parse_scan_error_kind(error),
                 children_loaded=not bool(is_dir),
                 size_is_partial=bool(partial),
                 selectable=error is None,

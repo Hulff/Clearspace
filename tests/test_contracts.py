@@ -12,6 +12,7 @@ from clearspace.contracts import (
     SelectionModel,
     SelectionState,
 )
+import clearspace.contracts as contracts_module
 
 
 def make_tree(tmp_path: Path) -> tuple[Node, Node, Node]:
@@ -86,6 +87,17 @@ def test_procedure_availability_and_admin_copy_only(monkeypatch: pytest.MonkeyPa
     assert normal.command_to_copy is None
     assert admin.available
     assert admin.command_to_copy == ("tool", "clean")
+
+
+def test_scan_errors_are_classified_for_each_unreadable_entry() -> None:
+    classify = getattr(contracts_module, "classify_scan_error", None)
+    error_kind = getattr(contracts_module, "ScanErrorKind", None)
+    assert callable(classify), "scanner must classify entry errors"
+    assert error_kind is not None, "scan error kind is missing"
+
+    assert classify(PermissionError(13, "denied")) is error_kind.PERMISSION
+    assert classify(FileNotFoundError(2, "missing")) is error_kind.NOT_FOUND
+    assert classify(OSError(5, "I/O failure")) is error_kind.IO
 
 
 def test_rules_match_general_glob_name_and_category() -> None:

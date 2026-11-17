@@ -1,6 +1,0 @@
-[workspace]
-resolver = "2"
-members = ["gtk4-rs", "slint", "rune"]
-
-[patch.crates-io]
-parley_engine = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90", package = "parley_engine" }

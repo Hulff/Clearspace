@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import threading
 import time
+import random
+from dataclasses import replace
 from types import SimpleNamespace
 from pathlib import Path
 
@@ -84,14 +86,15 @@ def test_progress_throttle_caps_updates_and_allows_terminal_event() -> None:
 def test_scan_controller_pause_resume_cancel_keeps_partial_result() -> None:
     controller = ScanController()
     started = threading.Event()
+    checkpoint = threading.Event()
     release = threading.Event()
     observed = []
 
     def fake_scanner(publish, cancel_event, pause_event):
         started.set()
         publish(ProgressEvent(dirs_done=2, dirs_total_est=5, files=3, bytes=30))
-        if not pause_event.wait(timeout=1):
-            raise AssertionError("initial scan was unexpectedly paused")
+        assert checkpoint.wait(timeout=1)
+        controller.wait_if_paused()
         while not release.wait(timeout=0.01):
             if cancel_event.is_set():
                 break
@@ -101,9 +104,16 @@ def test_scan_controller_pause_resume_cancel_keeps_partial_result() -> None:
     controller.start(fake_scanner)
     assert started.wait(timeout=1)
     controller.pause()
+    assert controller.latest_snapshot().state is ScanState.RUNNING
+    checkpoint.set()
+    deadline = time.monotonic() + 1
+    while controller.latest_snapshot().state is not ScanState.PAUSED and time.monotonic() < deadline:
+        time.sleep(0.001)
     assert controller.latest_snapshot().state is ScanState.PAUSED
     controller.resume()
-    assert controller.latest_snapshot().state is ScanState.RUNNING
+    deadline = time.monotonic() + 1
+    while controller.latest_snapshot().state is not ScanState.RUNNING and time.monotonic() < deadline:
+        time.sleep(0.001)
     controller.cancel()
     release.set()
     thread = controller._thread
@@ -117,22 +127,10 @@ def test_scan_controller_pause_resume_cancel_keeps_partial_result() -> None:
     assert snapshot.partial
 
 
-def test_scan_controller_terminal_snapshot_cannot_be_overwritten_by_racing_pause() -> None:
+def test_scan_controller_terminal_snapshot_is_absorbing_for_controls() -> None:
     controller = ScanController()
     task_started = threading.Event()
     finish_task = threading.Event()
-    pause_publish_waiting = threading.Event()
-    release_pause_publish = threading.Event()
-    original_publish = controller.publish
-
-    def gate_pause_publish(event: ProgressEvent) -> None:
-        if event.state is ScanState.PAUSED:
-            pause_publish_waiting.set()
-            assert release_pause_publish.wait(timeout=1)
-        original_publish(event)
-
-    controller.publish = gate_pause_publish
-
     def fake_scanner(_publish, _cancel_event, _pause_event):
         task_started.set()
         assert finish_task.wait(timeout=1)
@@ -140,19 +138,17 @@ def test_scan_controller_terminal_snapshot_cannot_be_overwritten_by_racing_pause
 
     controller.start(fake_scanner)
     assert task_started.wait(timeout=1)
-    pause_thread = threading.Thread(target=controller.pause)
-    pause_thread.start()
-    assert pause_publish_waiting.wait(timeout=1)
-
+    controller.pause()
     finish_task.set()
     scan_thread = controller._thread
     assert scan_thread is not None
     scan_thread.join(timeout=1)
-    assert controller.latest_snapshot().state is ScanState.DONE
-    release_pause_publish.set()
-    pause_thread.join(timeout=1)
-
-    assert controller.latest_snapshot().state is ScanState.DONE
+    terminal = controller.latest_snapshot()
+    assert terminal.state is ScanState.DONE
+    controller.pause()
+    controller.resume()
+    controller.cancel()
+    assert controller.latest_snapshot() is terminal
 
 
 def test_scan_controller_publishes_error_terminal_state_when_task_raises() -> None:
@@ -170,6 +166,154 @@ def test_scan_controller_publishes_error_terminal_state_when_task_raises() -> No
     assert controller.latest_snapshot().partial
     assert isinstance(controller.error, OSError)
     assert str(controller.error) == "synthetic scan failure"
+
+
+def test_controls_and_late_progress_cannot_change_a_done_snapshot() -> None:
+    controller = ScanController()
+
+    def completed_scan(publish, _cancel_event, _pause_event):
+        publish(ProgressEvent(dirs_done=3, dirs_total_est=9, files=4, bytes=80))
+        return "inventory"
+
+    controller.start(completed_scan)
+    thread = controller._thread
+    assert thread is not None
+    thread.join(timeout=1)
+    terminal = controller.latest_snapshot()
+
+    assert terminal.state is ScanState.DONE
+    assert terminal.dirs_total_est == terminal.dirs_done
+    assert progress_percent(terminal) == 100
+    controller.pause()
+    controller.resume()
+    controller.cancel()
+    controller.publish(ProgressEvent(dirs_done=0, dirs_total_est=1, state=ScanState.RUNNING))
+
+    assert controller.latest_snapshot() == terminal
+    assert not controller._cancel.is_set()
+
+
+def test_pause_and_resume_only_apply_snapshot_state_in_worker_thread() -> None:
+    controller = ScanController()
+    started = threading.Event()
+    checkpoint = threading.Event()
+    release_worker = threading.Event()
+
+    def scanner(_publish, _cancel_event, _pause_event):
+        started.set()
+        assert checkpoint.wait(timeout=1)
+        if not controller.wait_if_paused():
+            return "cancelled"
+        assert release_worker.wait(timeout=1)
+        return "inventory"
+
+    controller.start(scanner)
+    assert started.wait(timeout=1)
+    controller.pause()
+    assert controller.latest_snapshot().state is ScanState.RUNNING
+    checkpoint.set()
+    deadline = time.monotonic() + 1
+    while controller.latest_snapshot().state is not ScanState.PAUSED and time.monotonic() < deadline:
+        time.sleep(0.001)
+    assert controller.latest_snapshot().state is ScanState.PAUSED
+    controller.resume()
+    assert controller.latest_snapshot().state is ScanState.PAUSED
+    release_worker.set()
+    thread = controller._thread
+    assert thread is not None
+    thread.join(timeout=1)
+    assert controller.latest_snapshot().state is ScanState.DONE
+
+
+def test_random_control_interleavings_preserve_monotonic_and_absorbing_state() -> None:
+    terminal_states = {ScanState.DONE, ScanState.CANCELLED, ScanState.ERROR}
+    for seed in range(32):
+        rng = random.Random(seed)
+        controller = ScanController()
+        started = threading.Event()
+        finish = threading.Event()
+
+        def scanner(publish, cancel_event, _pause_event):
+            started.set()
+            for index in range(20):
+                if not controller.wait_if_paused():
+                    break
+                publish(ProgressEvent(
+                    dirs_done=index,
+                    dirs_total_est=20,
+                    files=index,
+                    bytes=index * 512,
+                    current_path=f"/synthetic/{index}",
+                ))
+                if cancel_event.is_set():
+                    break
+                time.sleep(0.0002)
+            finish.wait(timeout=1)
+            return "partial inventory"
+
+        controller.start(scanner)
+        assert started.wait(timeout=1)
+        observed = []
+        for _ in range(12):
+            action = rng.choice((controller.pause, controller.resume, controller.cancel))
+            action()
+            observed.append(controller.latest_snapshot())
+            time.sleep(rng.random() * 0.001)
+        controller.resume()
+        finish.set()
+        thread = controller._thread
+        assert thread is not None
+        thread.join(timeout=1)
+        observed.append(controller.latest_snapshot())
+
+        final = controller.latest_snapshot()
+        assert final.state in terminal_states
+        for before, after in zip(observed, observed[1:]):
+            assert after.dirs_done >= before.dirs_done
+            assert after.files >= before.files
+            assert after.bytes >= before.bytes
+            assert after.unreadable_count >= before.unreadable_count
+        controller.pause()
+        controller.resume()
+        controller.cancel()
+        controller.publish(ProgressEvent(dirs_done=0, dirs_total_est=0))
+        assert controller.latest_snapshot() == final
+
+
+def test_watchdog_announces_stalled_current_path_and_resets_on_progress() -> None:
+    watchdog_type = getattr(progress_module, "ProgressWatchdog", None)
+    assert watchdog_type is not None, "ProgressWatchdog must report stalled scans"
+    watchdog = watchdog_type(timeout_seconds=5)
+    event = ProgressEvent(
+        dirs_done=2,
+        dirs_total_est=20,
+        files=10,
+        current_path="/synthetic/large-folder",
+    )
+
+    assert watchdog.update(event, now=10.0) is None
+    assert watchdog.update(event, now=14.9) is None
+    assert watchdog.update(event, now=15.0) == "Still working on /synthetic/large-folder"
+    assert watchdog.update(
+        replace(event, files=11, current_path="/synthetic/next-folder"), now=15.1
+    ) is None
+
+
+def test_eta_text_uses_finishing_instead_of_zero_and_done_is_exact() -> None:
+    eta_label = getattr(progress_module, "eta_label", None)
+    assert callable(eta_label), "eta_label must format finishing and terminal states"
+    running = ProgressEvent(dirs_done=99, dirs_total_est=100)
+    done = ProgressEvent(dirs_done=5, dirs_total_est=9, state=ScanState.DONE)
+
+    assert eta_label(running, 0, 99) == "Finishing..."
+    assert eta_label(running, 1, 99) == "Finishing..."
+    assert eta_label(done, 0, 100) == "Complete"
+
+
+def test_progress_event_includes_unreadable_count() -> None:
+    assert "unreadable_count" in ProgressEvent.__dataclass_fields__
+    event = ProgressEvent(unreadable_count=3)
+    assert event.unreadable_count == 3
 
 def test_progress_formatting() -> None:
     assert format_size_gib(1024**3) == "1.0 GiB"

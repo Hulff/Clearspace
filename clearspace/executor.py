@@ -450,6 +450,11 @@ def _validate_path(
         raise ProtectedPathError(
             f"Caminho protegido (raiz protegida) pela regra '{rule}': {protected_path}"
         )
+    home = Path.home().resolve(strict=False)
+    if canonical == home:
+        raise ProtectedPathError(
+            f"Caminho protegido: o próprio diretório home não pode ser alterado ({home})"
+        )
     active_application = _active_application_match(canonical, active_paths)
     if active_application is not None:
         raise ActiveApplicationError(
@@ -633,7 +638,6 @@ def _protected_rule_match(path: Path) -> tuple[str, Path] | None:
         (f"system root {value}", Path(value).resolve(strict=False))
         for value in SYSTEM_PROTECTED
     ]
-    exact_roots.append(("home directory", home))
     for relative, rule in (
         (".ssh", "SSH credentials"),
         (".gnupg", "GPG credentials"),
@@ -653,9 +657,6 @@ def _protected_rule_match(path: Path) -> tuple[str, Path] | None:
         exact_roots.append((rule, home / relative))
     for rule, protected_root in exact_roots:
         if protected_root == Path("/"):
-            if resolved == protected_root:
-                return rule, protected_root
-        elif rule == "home directory":
             if resolved == protected_root:
                 return rule, protected_root
         elif _is_below(resolved, protected_root):

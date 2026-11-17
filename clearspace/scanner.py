@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
-from .contracts import Node
+from .contracts import Node, classify_scan_error
 from .progress import ProgressEvent, ProgressThrottle, ScanState, TopKTracker
 
 logger = logging.getLogger(__name__)
@@ -83,10 +83,11 @@ class TreeScanner:
                 info = current.lstat()
             except OSError as error:
                 self._log_error(current, error)
-                root = Node(root_path, root_path.name, True, 0,
-                            error=self._error_text(error), children_loaded=True,
-                            size_is_partial=True, selectable=False)
                 self.report["errors"] += 1
+                root = Node(root_path, root_path.name, True, 0,
+                            error=self._error_text(error), error_kind=classify_scan_error(error),
+                            children_loaded=True,
+                            size_is_partial=True, selectable=False)
                 self._finish_report(root, started)
                 self._emit_progress(current, state=ScanState.ERROR, partial=True, force=True)
                 return root
@@ -141,6 +142,7 @@ class TreeScanner:
             state=state,
             partial=partial,
             largest_items=self.top_items.snapshot(),
+            unreadable_count=int(self.report.get("errors", 0)),
         ))
 
     def _checkpoint(self) -> bool:
@@ -246,6 +248,7 @@ class TreeScanner:
                             False,
                             0,
                             error=self._error_text(error),
+                            error_kind=classify_scan_error(error),
                             size_is_partial=True,
                             selectable=False,
                         )
@@ -309,7 +312,7 @@ class TreeScanner:
         except OSError as error:
             node = Node(path, path.name or str(path), True, 0,
                         error=self._error_text(error), size_is_partial=True,
-                        selectable=False)
+                        selectable=False, error_kind=classify_scan_error(error))
             self._log_error(path, error)
             return node
 
@@ -349,6 +352,7 @@ class TreeScanner:
     def _set_error(self, node: Node, error: OSError) -> None:
         self.report["errors"] += 1
         node.error = self._error_text(error)
+        node.error_kind = classify_scan_error(error)
         node.size_is_partial = True
         node.selectable = False
         self._log_error(node.path, error)

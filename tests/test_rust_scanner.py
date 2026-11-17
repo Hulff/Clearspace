@@ -28,6 +28,7 @@ def test_protocol_v2_progress_preserves_paths_top_k_and_previous_estimate() -> N
             "files": 9,
             "allocated_bytes": 1024,
             "errors": 1,
+            "unreadable_count": 2,
             "current_path": "/scan/root/subdir",
             "largest_items": [
                 {"name": "large.bin", "path": "/scan/root/large.bin", "bytes": 512}
@@ -44,6 +45,7 @@ def test_protocol_v2_progress_preserves_paths_top_k_and_previous_estimate() -> N
     assert event.current_path == "/scan/root/subdir"
     assert event.largest_items == (("large.bin", "/scan/root/large.bin", 512),)
     assert event.partial
+    assert event.unreadable_count == 2
 
 
 def test_protocol_v2_progress_rejects_an_oversized_top_list() -> None:

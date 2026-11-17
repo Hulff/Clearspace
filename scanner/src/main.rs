@@ -49,6 +49,15 @@ fn directory_estimate(done: u64, queued: u64) -> u64 {
     done.saturating_add(queued)
 }
 
+fn scan_error_text(error: &io::Error) -> String {
+    let kind = match error.kind() {
+        io::ErrorKind::PermissionDenied => "permission",
+        io::ErrorKind::NotFound => "not_found",
+        _ => "io",
+    };
+    format!("[{kind}] não foi possível ler: {error}")
+}
+
 fn largest_json(items: &[LargestItem]) -> String {
     let entries = items
         .iter()
@@ -192,6 +201,32 @@ fn aggregate_directories(conn: &Connection) -> Result<(), String> {
     conn.execute_batch("DROP INDEX nodes_parent_idx")
         .map_err(|error| format!("drop temporary aggregation index: {error}"))?;
     Ok(())
+}
+
+fn prepare_child_counts(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "CREATE TEMP TABLE child_totals AS
+             SELECT parent_id,COUNT(*) AS child_count,COALESCE(SUM(size_blocks),0) AS child_size_blocks
+             FROM nodes WHERE parent_id IS NOT NULL GROUP BY parent_id;
+         CREATE INDEX child_totals_parent_idx ON child_totals(parent_id);",
+    )
+    .map_err(|error| format!("prepare child counts: {error}"))
+}
+
+fn aggregate_child_counts(conn: &Connection) -> Result<(), String> {
+    prepare_child_counts(conn)?;
+    apply_child_counts(conn)
+}
+
+fn apply_child_counts(conn: &Connection) -> Result<(), String> {
+    conn.execute_batch(
+        "UPDATE nodes SET
+             child_count=COALESCE((SELECT child_count FROM child_totals WHERE child_totals.parent_id=nodes.id),0),
+             child_size_blocks=COALESCE((SELECT child_size_blocks FROM child_totals WHERE child_totals.parent_id=nodes.id),0)
+         WHERE is_dir=1;
+         DROP TABLE child_totals;",
+    )
+    .map_err(|error| format!("compute child counts: {error}"))
 }
 
 fn mtime_ns(metadata: &fs::Metadata) -> i64 {
@@ -360,7 +395,10 @@ fn process(
             Err(error) => {
                 counts.errors += 1;
                 let path = error.path().unwrap_or(&root);
-                let msg = format!("não foi possível ler: {error}");
+                let msg = error
+                    .io_error()
+                    .map(scan_error_text)
+                    .unwrap_or_else(|| format!("[io] não foi possível ler: {error}"));
                 if path == root {
                     conn.execute(
                         "UPDATE nodes SET error=?1,partial=1 WHERE id=?2",
@@ -397,7 +435,13 @@ fn process(
                 counts.errors += 1;
                 conn.execute(
                     "UPDATE nodes SET error=?1,partial=1 WHERE id=?2",
-                    params![format!("não foi possível ler: {error}"), root_id],
+                    params![
+                        error
+                            .io_error()
+                            .map(scan_error_text)
+                            .unwrap_or_else(|| format!("[io] não foi possível ler: {error}")),
+                        root_id
+                    ],
                 )
                 .map_err(|e| e.to_string())?;
             }
@@ -405,10 +449,11 @@ fn process(
         }
         let path = entry.path();
         counts.current_path = path.to_string_lossy().into_owned();
-        let traversal_error = entry
-            .read_children_error
-            .as_ref()
-            .map(|e| format!("não foi possível ler: {e}"));
+        let traversal_error = entry.read_children_error.as_ref().map(|e| {
+            e.io_error()
+                .map(scan_error_text)
+                .unwrap_or_else(|| format!("[io] não foi possível ler: {e}"))
+        });
         if traversal_error.is_some() {
             counts.errors += 1;
         }
@@ -417,7 +462,10 @@ fn process(
             Err(error) => {
                 counts.errors += 1;
                 let parent = parent_id(&conn, &path, &root)?;
-                let msg = format!("não foi possível ler: {error}");
+                let msg = error
+                    .io_error()
+                    .map(scan_error_text)
+                    .unwrap_or_else(|| format!("[io] não foi possível ler: {error}"));
                 let name = path.file_name().unwrap_or_default().to_string_lossy();
                 insert(
                     &conn,
@@ -500,12 +548,13 @@ fn process(
             emit(
                 "progress",
                 &format!(
-                    ",\"directories\":{},\"dirs_done\":{},\"dirs_queued\":{},\"dirs_total_est\":{},\"files\":{},\"errors\":{},\"allocated_bytes\":{},\"current_path\":\"{}\",\"largest_items\":{}",
+                    ",\"directories\":{},\"dirs_done\":{},\"dirs_queued\":{},\"dirs_total_est\":{},\"files\":{},\"errors\":{},\"unreadable_count\":{},\"allocated_bytes\":{},\"current_path\":\"{}\",\"largest_items\":{}",
                     counts.directories,
                     counts.dirs_done,
                     dirs_queued,
                     directory_estimate(counts.dirs_done, dirs_queued),
                     counts.files,
+                    counts.errors,
                     counts.errors,
                     counts.allocated_bytes,
                     json_escape(&counts.current_path),
@@ -517,11 +566,9 @@ fn process(
         }
     }
     aggregate_directories(&conn)?;
-    conn.execute_batch("CREATE INDEX nodes_parent_idx ON nodes(parent_id);
-        CREATE TEMP TABLE child_totals AS SELECT parent_id,COUNT(*) AS child_count,COALESCE(SUM(size_blocks),0) AS child_size_blocks FROM nodes WHERE parent_id IS NOT NULL GROUP BY parent_id;
-        UPDATE nodes SET child_count=COALESCE((SELECT child_count FROM child_totals WHERE child_totals.parent_id=nodes.id),0),child_size_blocks=COALESCE((SELECT child_size_blocks FROM child_totals WHERE child_totals.parent_id=nodes.id),0) WHERE is_dir=1;
-        DROP TABLE child_totals;")
-        .map_err(|error| format!("compute child counts: {error}"))?;
+    conn.execute_batch("CREATE INDEX nodes_parent_idx ON nodes(parent_id);")
+        .map_err(|error| format!("create final parent index: {error}"))?;
+    aggregate_child_counts(&conn)?;
     counts.other_filesystems_skipped = skipped_mounts.load(Ordering::Relaxed);
     counts.symlinks_skipped = skipped_symlinks.load(Ordering::Relaxed);
     counts.dirs_done = discovered_directories.load(Ordering::Relaxed);
@@ -554,11 +601,12 @@ fn main() {
     match process(&root, &db, &excludes, include_hidden, stay_on_device) {
         Ok((c, root_id)) => {
             let final_progress = format!(
-                ",\"directories\":{},\"dirs_done\":{},\"dirs_queued\":0,\"dirs_total_est\":{},\"files\":{},\"errors\":{},\"allocated_bytes\":{},\"current_path\":\"{}\",\"largest_items\":{}",
+                ",\"directories\":{},\"dirs_done\":{},\"dirs_queued\":0,\"dirs_total_est\":{},\"files\":{},\"errors\":{},\"unreadable_count\":{},\"allocated_bytes\":{},\"current_path\":\"{}\",\"largest_items\":{}",
                 c.directories,
                 c.dirs_done,
                 directory_estimate(c.dirs_done, 0),
                 c.files,
+                c.errors,
                 c.errors,
                 c.allocated_bytes,
                 json_escape(&c.current_path),
@@ -569,13 +617,14 @@ fn main() {
                 .first_progress_ms
                 .map_or_else(|| "null".to_owned(), |value| value.to_string());
             let fields = format!(
-                ",\"root_id\":{root_id},\"nodes\":{},\"directories\":{},\"dirs\":{},\"dirs_done\":{},\"dirs_queued\":0,\"dirs_total_est\":{},\"files\":{},\"errors\":{},\"symlinks_skipped\":{},\"other_filesystems_skipped\":{},\"allocated_bytes\":{},\"bytes\":{},\"current_path\":\"{}\",\"largest_items\":{},\"first_progress_ms\":{},\"duration_ms\":{}",
+                ",\"root_id\":{root_id},\"nodes\":{},\"directories\":{},\"dirs\":{},\"dirs_done\":{},\"dirs_queued\":0,\"dirs_total_est\":{},\"files\":{},\"errors\":{},\"unreadable_count\":{},\"symlinks_skipped\":{},\"other_filesystems_skipped\":{},\"allocated_bytes\":{},\"bytes\":{},\"current_path\":\"{}\",\"largest_items\":{},\"first_progress_ms\":{},\"duration_ms\":{}",
                 c.nodes,
                 c.directories,
                 c.directories,
                 c.dirs_done,
                 c.dirs_done,
                 c.files,
+                c.errors,
                 c.errors,
                 c.symlinks_skipped,
                 c.other_filesystems_skipped,
@@ -603,6 +652,18 @@ fn main() {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn classifies_per_entry_io_errors_for_the_database() {
+        assert!(
+            scan_error_text(&io::Error::from(io::ErrorKind::PermissionDenied))
+                .starts_with("[permission]")
+        );
+        assert!(
+            scan_error_text(&io::Error::from(io::ErrorKind::NotFound)).starts_with("[not_found]")
+        );
+        assert!(scan_error_text(&io::Error::from(io::ErrorKind::Other)).starts_with("[io]"));
+    }
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
@@ -653,6 +714,45 @@ mod tests {
         fn drop(&mut self) {
             let _ = fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn child_count_rollup_uses_indexed_parent_lookups() {
+        let conn = Connection::open_in_memory().expect("open in-memory database");
+        conn.execute_batch(
+            "CREATE TABLE nodes(id INTEGER PRIMARY KEY,parent_id INTEGER,is_dir INTEGER,child_count INTEGER DEFAULT 0,child_size_blocks INTEGER DEFAULT 0,size_blocks INTEGER);
+             INSERT INTO nodes(id,parent_id,is_dir,size_blocks) VALUES (1,NULL,1,0),(2,1,1,0),(3,1,0,7),(4,2,0,11);",
+        )
+        .expect("create rollup fixture");
+
+        prepare_child_counts(&conn).expect("prepare child counts");
+
+        let plan = conn
+            .prepare(
+                "EXPLAIN QUERY PLAN UPDATE nodes SET
+                    child_count=COALESCE((SELECT child_count FROM child_totals WHERE child_totals.parent_id=nodes.id),0),
+                    child_size_blocks=COALESCE((SELECT child_size_blocks FROM child_totals WHERE child_totals.parent_id=nodes.id),0)
+                 WHERE is_dir=1",
+            )
+            .expect("prepare query plan")
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("read query plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect query plan");
+        assert!(
+            plan.iter()
+                .any(|line| line.contains("SEARCH child_totals USING INDEX")),
+            "expected indexed parent lookup, got {plan:?}"
+        );
+        apply_child_counts(&conn).expect("aggregate child counts");
+        let root: (i64, i64) = conn
+            .query_row(
+                "SELECT child_count,child_size_blocks FROM nodes WHERE id=1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read root child totals");
+        assert_eq!(root, (2, 7));
     }
 
     #[test]

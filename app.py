@@ -36,9 +36,11 @@ from clearspace.core import History, format_bytes, inspection_only_paths
 from clearspace.progress import (
     EtaEstimator,
     ProgressEvent,
+    ProgressWatchdog,
     ScanController,
     ScanState,
     format_elapsed,
+    eta_label,
     format_size_gib,
     filesystem_stats,
     progress_percent,
@@ -328,6 +330,7 @@ class Clearspace(Gtk.Application):
         stats.set_column_homogeneous(True)
         for index, (heading, attribute) in enumerate((
             ("Files analyzed", "scan_files_value"),
+            ("Unreadable entries", "scan_unreadable_value"),
             ("Measured", "scan_bytes_value"),
             ("Elapsed", "scan_elapsed_value"),
             ("Time left · estimate", "scan_eta_value"),
@@ -1004,6 +1007,7 @@ class Clearspace(Gtk.Application):
         self._scan_generation += 1
         self._scan_started_at = time.monotonic()
         self._scan_eta = EtaEstimator()
+        self._scan_watchdog = ProgressWatchdog()
         self._scan_largest_items = ()
         self._scan_last_top_render = 0.0
         self.stack.set_visible_child_name("scanning")
@@ -1014,6 +1018,7 @@ class Clearspace(Gtk.Application):
         self.scan_percent_label.set_text("")
         self.scan_progress_bar.set_fraction(0)
         self.scan_files_value.set_text("0")
+        self.scan_unreadable_value.set_text("0")
         self.scan_bytes_value.set_text("0.0 GiB")
         self.scan_elapsed_value.set_text("0:00")
         self.scan_eta_value.set_text("Calculating…")
@@ -1086,6 +1091,7 @@ class Clearspace(Gtk.Application):
                 include_hidden=scan_options.include_hidden,
                 stay_on_device=scan_options.stay_on_disk_only,
                 progress=publish_live_progress,
+                state_changed=self.scan_controller.apply_control_state,
             )
             root = scanner.scan_root(
                 cancel_event=cancel_event,
@@ -1130,7 +1136,9 @@ class Clearspace(Gtk.Application):
         if event.state is ScanState.CANCELLED:
             self.scan_button.set_sensitive(True)
             self._workflow_busy = False
-            self.stack.set_visible_child_name("choose")
+            self.partial_banner.set_visible(True)
+            self.disk_label.set_text("Scan cancelled; the visible scan data is partial.")
+            self.stack.set_visible_child_name("results")
             return GLib.SOURCE_REMOVE
         if controller.error:
             self._finish_scan_error(controller.error)
@@ -1169,7 +1177,7 @@ class Clearspace(Gtk.Application):
             self.recent_scan_label.set_text(
                 f"Could not save scan history: {error.strerror or error}"
             )
-        if report["partial"]:
+        if event.state in {ScanState.CANCELLED, ScanState.ERROR}:
             self.partial_banner.set_visible(True)
         self._update_assistant_greeting(assistant_context)
         return GLib.SOURCE_REMOVE
@@ -1269,7 +1277,11 @@ class Clearspace(Gtk.Application):
 
     def _update_scanning_view(self, event: ProgressEvent):
         total = event.dirs_total_est
-        if total:
+        if event.state is ScanState.DONE:
+            self.scan_counter_label.set_text(
+                f"{event.dirs_done:,} / {event.dirs_done:,} folders"
+            )
+        elif total:
             self.scan_counter_label.set_text(
                 f"{event.dirs_done:,} / ~{total:,} folders"
             )
@@ -1286,6 +1298,7 @@ class Clearspace(Gtk.Application):
             self.scan_percent_label.set_text(f"{percent}%")
             self.scan_progress_bar.set_fraction(percent / 100)
         self.scan_files_value.set_text(f"{event.files:,}")
+        self.scan_unreadable_value.set_text(f"{event.unreadable_count:,}")
         self.scan_bytes_value.set_text(format_size_gib(event.bytes))
         elapsed_ms = max(
             event.elapsed_ms,
@@ -1296,12 +1309,12 @@ class Clearspace(Gtk.Application):
             bool((percent is not None and percent >= 5) or elapsed_ms >= 5_000)
         )
         eta = self._scan_eta.remaining_seconds(event)
-        if eta is None:
-            self.scan_eta_value.set_text("Calculating…")
-        else:
-            self.scan_eta_value.set_text(f"~{format_elapsed(eta * 1000)}")
+        self.scan_eta_value.set_text(eta_label(event, eta, percent))
         path = event.current_path or str(self.scan_root)
-        self.scan_path_label.set_text(f"Now scanning: {path}")
+        watchdog_message = self._scan_watchdog.update(event)
+        self.scan_path_label.set_text(
+            f"{watchdog_message or f'Now scanning: {path}'}"
+        )
         if event.filesystem_error:
             self.scan_subtitle.set_text(
                 f"Filesystem capacity unavailable: {event.filesystem_error}"
@@ -1318,8 +1331,19 @@ class Clearspace(Gtk.Application):
             self._scan_last_top_render = now
         if event.state is ScanState.PAUSED:
             self.scan_pause_button.set_label("Resume")
+            self.scan_pause_button.set_sensitive(True)
         elif event.state is ScanState.RUNNING:
             self.scan_pause_button.set_label("Pause")
+            self.scan_pause_button.set_sensitive(True)
+        elif event.state in {ScanState.DONE, ScanState.CANCELLED, ScanState.ERROR}:
+            labels = {
+                ScanState.DONE: "Done",
+                ScanState.CANCELLED: "Cancelled",
+                ScanState.ERROR: "Error",
+            }
+            self.scan_pause_button.set_label(labels[event.state])
+            self.scan_pause_button.set_sensitive(False)
+            self.scan_cancel_button.set_sensitive(False)
 
     def _render_biggest_so_far(self):
         largest = self._scan_largest_items
@@ -1355,6 +1379,9 @@ class Clearspace(Gtk.Application):
 
     def _finish_scan_error(self, error):
         self.disk_label.set_text(f"Could not read the tree: {error}")
+        self.partial_banner.set_visible(True)
+        self.scan_pause_button.set_sensitive(False)
+        self.scan_cancel_button.set_sensitive(False)
         self.scan_button.set_sensitive(True)
         self._workflow_busy = False
         self.stack.set_visible_child_name("results")
@@ -1473,7 +1500,8 @@ class Clearspace(Gtk.Application):
         loading: bool = False,
         parent_entry: TreeEntry | None = None,
     ) -> TreeEntry:
-        if any(
+        home = Path(GLib.get_home_dir()).resolve(strict=False)
+        if node.path.resolve(strict=False) == home or any(
             node.path == protected
             or node.path.is_relative_to(protected)
             or protected.is_relative_to(node.path)

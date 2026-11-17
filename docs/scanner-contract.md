@@ -133,14 +133,14 @@ directory estimate, optionally informed by a previous complete scan of the same
 root stored in local JSONL history.
 
 ```jsonl
-{"protocol_version":2,"event":"progress","dirs_done":43,"dirs_queued":9,"dirs_total_est":52,"files":2048,"bytes":73400320,"elapsed_ms":1200,"current_path":"/scan/root/example","largest_items":[{"name":"example","path":"/scan/root/example","bytes":7340032}],"state":"running","partial":false}
-{"protocol_version":2,"event":"progress","dirs_done":47,"dirs_queued":14,"dirs_total_est":61,"files":2100,"bytes":75497472,"elapsed_ms":1300,"current_path":"/scan/root/another","largest_items":[{"name":"example","path":"/scan/root/example","bytes":7340032}],"state":"running","partial":false}
-{"protocol_version":2,"event":"completed","dirs_done":61,"dirs_queued":0,"dirs_total_est":61,"files":2177,"bytes":75497472,"elapsed_ms":1500,"largest_items":[{"name":"example","path":"/scan/root/example","bytes":7340032}],"state":"done","partial":false}
+{"protocol_version":2,"event":"progress","dirs_done":43,"dirs_queued":9,"dirs_total_est":52,"files":2048,"errors":0,"unreadable_count":0,"bytes":73400320,"elapsed_ms":1200,"current_path":"/scan/root/example","largest_items":[{"name":"example","path":"/scan/root/example","bytes":7340032}],"state":"running","partial":false}
+{"protocol_version":2,"event":"progress","dirs_done":47,"dirs_queued":14,"dirs_total_est":61,"files":2100,"errors":2,"unreadable_count":2,"bytes":75497472,"elapsed_ms":1300,"current_path":"/scan/root/another","largest_items":[{"name":"example","path":"/scan/root/example","bytes":7340032}],"state":"running","partial":true}
+{"protocol_version":2,"event":"completed","dirs_done":61,"dirs_queued":0,"dirs_total_est":61,"files":2177,"errors":2,"unreadable_count":2,"bytes":75497472,"elapsed_ms":1500,"largest_items":[{"name":"example","path":"/scan/root/example","bytes":7340032}],"state":"done","partial":true}
 ```
 
 `dirs_total_est` is nonnegative and may increase as directories are discovered.
 `dirs_done`, `dirs_queued`, `files`,
-`bytes`, and `elapsed_ms` are nonnegative cumulative values; `bytes` means
+`bytes`, `errors`, `unreadable_count`, and `elapsed_ms` are nonnegative cumulative values; `unreadable_count` mirrors the count of per-entry read errors and each stored node error carries a stable `[permission]`, `[not_found]`, or `[io]` category. `bytes` means
 allocated bytes (`st_blocks * 512`). `current_path` is local display data only;
 it is untrusted and cannot authorize an action. `largest_items` is an optional
 bounded list of up to four observed entries with display name, local path, and

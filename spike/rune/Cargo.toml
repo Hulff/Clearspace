@@ -1,9 +1,0 @@
-[package]
-name = "clearspace-spike-rune"
-version = "0.1.0"
-edition = "2024"
-publish = false
-
-[dependencies]
-rune = { git = "https://github.com/anomalyco/rune", rev = "eb5ae6c9f77b1a0051d8e1e5ee936ebea086bb90" }
-rusqlite = { version = "=0.38.0", features = ["bundled"] }

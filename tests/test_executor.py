@@ -211,9 +211,13 @@ def test_chosen_root_outside_home_is_the_single_path_source(tmp_path: Path) -> N
     assert result.success
     assert trash.paths == [root / "nested" / "cache.bin"]
     assert history.records[0]["path"] == str(target.resolve())
-    for protected_root in (Path("/"), Path("/usr"), Path.home()):
+    for protected_root in (Path("/"), Path("/usr")):
         with pytest.raises(UnsafePathError, match="protegida"):
             build_review([], allowed_root=protected_root, active_paths=())
+    with pytest.raises(UnsafePathError, match="próprio diretório home"):
+        build_review(
+            [Path.home()], allowed_root=Path.home().parent, active_paths=()
+        )
     with pytest.raises(UnsafePathError, match="fora da raiz"):
         build_review([Path.home() / "not-a-target"], allowed_root=root, active_paths=())
 
@@ -368,10 +372,11 @@ def test_explicit_protected_roots_and_registry_caches(tmp_path: Path, monkeypatc
     home.mkdir()
     monkeypatch.setenv("HOME", str(home))
     for protected in (
-        Path("/"), Path("/usr"), home, home / ".ssh", home / ".gnupg",
+        Path("/"), Path("/usr"), home / ".ssh", home / ".gnupg",
         home / ".config/Code/User",
     ):
         assert _protected_rule_match(protected) is not None
+    assert _protected_rule_match(home) is None
     assert _protected_rule_match(Path("/usr/share")) is not None
     assert _protected_rule_match(home / ".config/Code/User/settings.json") is not None
 
@@ -388,6 +393,32 @@ def test_explicit_protected_roots_and_registry_caches(tmp_path: Path, monkeypatc
     go_cache = cache_root / "go-build"
     go_cache.mkdir()
     assert _protected_rule_match(go_cache) is None
+
+
+def test_repository_inside_home_can_be_reviewed_but_keeps_user_data_risk(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    home = tmp_path / "fake-home"
+    repository = home / "repositories" / "project"
+    (repository / ".git").mkdir(parents=True)
+    (repository / "README.md").write_text("fixture", encoding="utf-8")
+    monkeypatch.setenv("HOME", str(home))
+
+    evaluation = RuleEngine().evaluate(Node(repository, "project", True, 7))
+    review = build_review(
+        [repository],
+        allowed_root=home,
+        risks={repository: evaluation.risk},
+        active_paths=(),
+    )
+
+    assert review.items[0].path == repository.resolve()
+    assert review.items[0].risk is Risk.USER_DATA
+    assert _protected_rule_match(home) is None
+    assert _protected_rule_match(home / ".ssh" / "id_ed25519")[0] == "SSH credentials"
+    parent = tmp_path
+    with pytest.raises(UnsafePathError, match="próprio diretório home"):
+        build_review([home], allowed_root=parent, active_paths=())
 
 
 def test_active_application_is_a_distinct_review_block(tmp_path: Path) -> None:

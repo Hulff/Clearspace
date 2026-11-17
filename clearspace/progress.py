@@ -39,6 +39,7 @@ class ProgressEvent:
     current_path: str = ""
     state: ScanState = ScanState.RUNNING
     partial: bool = False
+    unreadable_count: int = 0
     largest_items: tuple[tuple[str, str, int], ...] = ()
     fs_used_bytes: int | None = None
     fs_total_bytes: int | None = None
@@ -47,7 +48,7 @@ class ProgressEvent:
     root_is_mountpoint: bool = False
 
     def __post_init__(self) -> None:
-        for name in ("dirs_done", "files", "bytes", "elapsed_ms"):
+        for name in ("dirs_done", "files", "bytes", "elapsed_ms", "unreadable_count"):
             if getattr(self, name) < 0:
                 raise ValueError(f"{name} cannot be negative")
         if self.dirs_total_est is not None and self.dirs_total_est < 0:
@@ -102,6 +103,7 @@ class ScanController:
         self._error: BaseException | None = None
         self._started_at = 0.0
         self._terminal = False
+        self._worker_ident: int | None = None
 
     def start(self, task: ScanTask[T]) -> None:
         with self._lock:
@@ -121,6 +123,7 @@ class ScanController:
             self._thread.start()
 
     def _run(self, task: ScanTask[T]) -> None:
+        self._worker_ident = threading.get_ident()
         completed = False
         try:
             self._result = task(self.publish, self._cancel, self._pause)
@@ -130,11 +133,11 @@ class ScanController:
         finally:
             with self._lock:
                 current = self._snapshot
-                if self._error is not None:
-                    state = ScanState.ERROR
-                    partial = True
-                elif self._cancel.is_set():
+                if self._cancel.is_set():
                     state = ScanState.CANCELLED
+                    partial = True
+                elif self._error is not None:
+                    state = ScanState.ERROR
                     partial = True
                 elif completed:
                     state = ScanState.DONE
@@ -143,6 +146,8 @@ class ScanController:
                     state = ScanState.ERROR
                     partial = True
                 try:
+                    if state is ScanState.DONE:
+                        current = replace(current, dirs_total_est=current.dirs_done)
                     self._snapshot = replace(
                         current,
                         state=state,
@@ -167,28 +172,46 @@ class ScanController:
 
     def publish(self, event: ProgressEvent) -> None:
         """Publish a scanner snapshot, filling elapsed time if it was omitted."""
+        if threading.get_ident() != self._worker_ident:
+            return
         if event.elapsed_ms == 0 and self._started_at:
             event = replace(event, elapsed_ms=int((time.monotonic() - self._started_at) * 1000))
         with self._lock:
             if self._terminal:
                 return
-            self._snapshot = event
+            previous = self._snapshot
+            state = ScanState.PAUSED if not self._pause.is_set() else ScanState.RUNNING
+            self._snapshot = replace(
+                event,
+                dirs_done=max(previous.dirs_done, event.dirs_done),
+                dirs_total_est=max(
+                    previous.dirs_total_est or 0, event.dirs_total_est or 0
+                ) or None,
+                files=max(previous.files, event.files),
+                bytes=max(previous.bytes, event.bytes),
+                elapsed_ms=max(previous.elapsed_ms, event.elapsed_ms),
+                unreadable_count=max(previous.unreadable_count, event.unreadable_count),
+                state=state,
+            )
 
     def pause(self) -> None:
-        if self._thread is not None and self._thread.is_alive():
+        with self._lock:
+            if self._terminal or self._thread is None or not self._thread.is_alive():
+                return
             self._pause.clear()
-            current = self.latest_snapshot()
-            self.publish(replace(current, state=ScanState.PAUSED))
 
     def resume(self) -> None:
-        self._pause.set()
-        current = self.latest_snapshot()
-        if current.state is ScanState.PAUSED:
-            self.publish(replace(current, state=ScanState.RUNNING))
+        with self._lock:
+            if self._terminal:
+                return
+            self._pause.set()
 
     def cancel(self) -> None:
-        self._cancel.set()
-        self._pause.set()
+        with self._lock:
+            if self._terminal:
+                return
+            self._cancel.set()
+            self._pause.set()
 
     def latest_snapshot(self) -> ProgressEvent:
         with self._lock:
@@ -197,9 +220,21 @@ class ScanController:
     def wait_if_paused(self) -> bool:
         """Block a cooperative scanner until resumed; return false if cancelled."""
         while not self._pause.wait(timeout=0.1):
+            self.apply_control_state()
             if self._cancel.is_set():
                 return False
+        self.apply_control_state()
         return not self._cancel.is_set()
+
+    def apply_control_state(self) -> None:
+        """Apply a pending pause/resume request from the scanner worker only."""
+        if threading.get_ident() != self._worker_ident:
+            return
+        with self._lock:
+            if self._terminal:
+                return
+            state = ScanState.PAUSED if not self._pause.is_set() else ScanState.RUNNING
+            self._snapshot = replace(self._snapshot, state=state)
 
     @property
     def result(self) -> object | None:
@@ -298,6 +333,58 @@ def format_size_gib(size_bytes: int) -> str:
 def format_elapsed(milliseconds: int) -> str:
     seconds = max(0, milliseconds // 1000)
     return f"{seconds // 60}:{seconds % 60:02d}"
+
+
+def eta_label(event: ProgressEvent, eta_seconds: int | None, percent: int | None) -> str:
+    if event.state is ScanState.DONE:
+        return "Complete"
+    if event.state is ScanState.CANCELLED:
+        return "Cancelled"
+    if event.state is ScanState.ERROR:
+        return "Error"
+    if event.state is ScanState.PAUSED:
+        return "Paused"
+    if percent is not None and percent >= 99 or eta_seconds == 0:
+        return "Finishing..."
+    if eta_seconds is None:
+        return "Calculating..."
+    return f"~{format_elapsed(eta_seconds * 1000)}"
+
+
+class ProgressWatchdog:
+    """Report a path that has produced no observable progress for a while."""
+
+    timeout_seconds = 8.0
+
+    def __init__(self, timeout_seconds: float | None = None) -> None:
+        if timeout_seconds is not None and timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        self.timeout_seconds = (
+            type(self).timeout_seconds if timeout_seconds is None else timeout_seconds
+        )
+        self._signature: tuple | None = None
+        self._last_change = time.monotonic()
+        self._announced = False
+
+    def update(self, event: ProgressEvent, *, now: float | None = None) -> str | None:
+        current = time.monotonic() if now is None else now
+        if event.state is not ScanState.RUNNING or not event.current_path:
+            self._signature = None
+            self._last_change = current
+            self._announced = False
+            return None
+        signature = (
+            event.dirs_done, event.files, event.bytes, event.unreadable_count,
+            event.current_path,
+        )
+        if signature != self._signature:
+            self._signature = signature
+            self._last_change = current
+            self._announced = False
+        if current - self._last_change >= self.timeout_seconds and not self._announced:
+            self._announced = True
+            return f"Still working on {event.current_path}"
+        return None
 
 
 class TopKTracker:

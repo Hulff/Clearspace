@@ -2,12 +2,36 @@
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import shutil
 from dataclasses import dataclass, field
 from enum import StrEnum
 from pathlib import Path
 from typing import Protocol
+
+
+class ScanErrorKind(StrEnum):
+    PERMISSION = "permission"
+    NOT_FOUND = "not_found"
+    IO = "io"
+
+
+def classify_scan_error(error: OSError) -> ScanErrorKind:
+    if isinstance(error, PermissionError) or error.errno in {errno.EACCES, errno.EPERM}:
+        return ScanErrorKind.PERMISSION
+    if isinstance(error, FileNotFoundError) or error.errno == errno.ENOENT:
+        return ScanErrorKind.NOT_FOUND
+    return ScanErrorKind.IO
+
+
+def parse_scan_error_kind(message: str | None) -> ScanErrorKind | None:
+    if not message:
+        return None
+    for kind in ScanErrorKind:
+        if message.startswith(f"[{kind.value}]"):
+            return kind
+    return None
 
 
 class SelectionState(StrEnum):
@@ -38,6 +62,7 @@ class Node:
     loaded_child_size_bytes: int = 0
     is_more_row: bool = False
     more_offset: int = 0
+    error_kind: ScanErrorKind | None = None
 
     def __post_init__(self) -> None:
         if self.size_bytes < 0:

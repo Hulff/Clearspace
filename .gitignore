@@ -23,4 +23,11 @@ scanner/target/
 
 # Editor and OS files
 .DS_Store
+
 *~
+
+
+#
+.aws
+.agents
+.codex
