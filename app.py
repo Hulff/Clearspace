@@ -15,7 +15,18 @@ gi.require_version("Gtk", "4.0")
 gi.require_version("Gio", "2.0")
 from gi.repository import Gdk, Gio, GLib, GObject, Gtk
 
-from clearspace.contracts import Node, Risk, SelectionModel, SelectionState
+from clearspace.assistant import (
+    AssistantScanContext,
+    LocalRuleAssistant,
+    ScanConsumer,
+)
+from clearspace.contracts import (
+    Node,
+    ProposedActionKind,
+    Risk,
+    SelectionModel,
+    SelectionState,
+)
 from clearspace.core import History, format_bytes, inspection_only_paths
 from clearspace.progress import (
     EtaEstimator,
@@ -87,6 +98,9 @@ class Clearspace(Gtk.Application):
         self._scan_eta = EtaEstimator()
         self._scan_largest_items = ()
         self._scan_last_top_render = 0.0
+        self.local_assistant = LocalRuleAssistant()
+        self.assistant_context = AssistantScanContext(0, 0, 0, 0)
+        self.assistant_messages: list[tuple[str, str]] = []
 
     def do_activate(self):
         self.window = Gtk.ApplicationWindow(application=self, title="Clearspace")
@@ -301,10 +315,72 @@ class Clearspace(Gtk.Application):
         panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
         panel.set_margin_start(16)
         panel.set_margin_top(8)
-        panel.set_size_request(300, -1)
-        title = Gtk.Label(label="Detalhes", xalign=0)
+        panel.set_size_request(340, -1)
+
+        assistant_header = Gtk.Box(spacing=8)
+        title = Gtk.Label(label="Assistant", xalign=0, hexpand=True)
         title.add_css_class("title-3")
-        panel.append(title)
+        assistant_header.append(title)
+        self.assistant_toggle = Gtk.ToggleButton(label="Collapse")
+        self.assistant_toggle.set_active(False)
+        self.assistant_toggle.connect("toggled", self._toggle_assistant_panel)
+        assistant_header.append(self.assistant_toggle)
+        panel.append(assistant_header)
+
+        self.assistant_body = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        panel.append(self.assistant_body)
+        self.assistant_greeting = Gtk.Label(
+            label="The scan summary will appear here when scanning finishes.",
+            xalign=0,
+            wrap=True,
+        )
+        self.assistant_body.append(self.assistant_greeting)
+        messages_scroll = Gtk.ScrolledWindow(vexpand=True)
+        messages_scroll.set_min_content_height(96)
+        self.assistant_messages_scroll = messages_scroll
+        self.assistant_message_box = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=6
+        )
+        messages_scroll.set_child(self.assistant_message_box)
+        self.assistant_body.append(messages_scroll)
+
+        self.assistant_chips = Gtk.Box(
+            orientation=Gtk.Orientation.VERTICAL, spacing=5
+        )
+        self.assistant_body.append(self.assistant_chips)
+        for label, prompt in (
+            ("Suggest a safe cleanup", "Suggest a safe cleanup"),
+            ("What is using the most space?", "What is using the most space?"),
+        ):
+            self._add_assistant_chip(label, prompt)
+        self.explain_risk_chip = Gtk.Button(label="Explain the risk of the selected item")
+        self.explain_risk_chip.set_halign(Gtk.Align.START)
+        self.explain_risk_chip.connect(
+            "clicked", self._assistant_chip_clicked, "Explain the risk"
+        )
+        self.assistant_chips.append(self.explain_risk_chip)
+
+        input_row = Gtk.Box(spacing=6)
+        self.assistant_input = Gtk.Entry(hexpand=True)
+        self.assistant_input.set_placeholder_text("Ask about this scan")
+        self.assistant_input.connect("activate", self._assistant_input_activated)
+        input_row.append(self.assistant_input)
+        self.assistant_send_button = Gtk.Button(label="Send")
+        self.assistant_send_button.connect("clicked", self._assistant_send_clicked)
+        input_row.append(self.assistant_send_button)
+        self.assistant_body.append(input_row)
+        assistant_note = Gtk.Label(
+            label="Runs on your computer. It only suggests; you always confirm.",
+            xalign=0,
+            wrap=True,
+        )
+        assistant_note.add_css_class("selection-note")
+        self.assistant_body.append(assistant_note)
+
+        panel.append(Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL))
+        details_title = Gtk.Label(label="Details", xalign=0)
+        details_title.add_css_class("title-3")
+        panel.append(details_title)
         self.detail_title = Gtk.Label(label="Selecione um item", xalign=0, wrap=True)
         self.detail_title.add_css_class("heading")
         panel.append(self.detail_title)
@@ -329,6 +405,17 @@ class Clearspace(Gtk.Application):
         self._detail_entry: TreeEntry | None = None
         self._detail_procedure_argv: tuple[str, ...] | None = None
         return panel
+
+    def _add_assistant_chip(self, label: str, prompt: str) -> None:
+        button = Gtk.Button(label=label)
+        button.set_halign(Gtk.Align.START)
+        button.connect("clicked", self._assistant_chip_clicked, prompt)
+        self.assistant_chips.append(button)
+
+    def _toggle_assistant_panel(self, button) -> None:
+        collapsed = button.get_active()
+        self.assistant_body.set_visible(not collapsed)
+        button.set_label("Expand" if collapsed else "Collapse")
 
     def scan(self):
         self._scan_generation += 1
@@ -368,16 +455,44 @@ class Clearspace(Gtk.Application):
         def scan_task(publish, cancel_event, pause_event):
             import shutil
 
+            def publish_live_progress(event: ProgressEvent) -> None:
+                if event.state in {
+                    ScanState.RUNNING,
+                    ScanState.PAUSED,
+                }:
+                    publish(event)
+
             scanner = TreeScanner(self.scan_root)
             root = scanner.scan_root(
-                progress=publish,
+                progress=publish_live_progress,
                 cancel_event=cancel_event,
                 pause_event=pause_event,
             )
             evaluation = self.rule_engine.evaluate(root)
             inspection_roots = inspection_only_paths(self.scan_root)
             usage = shutil.disk_usage(self.scan_root)
-            return scanner, root, evaluation, usage, inspection_roots
+            consumers = []
+            for node in root.children:
+                if node.aggregate_count:
+                    continue
+                node_evaluation = self.rule_engine.evaluate(node)
+                consumers.append(ScanConsumer(
+                    node.path,
+                    node.name,
+                    node.size_bytes,
+                    node_evaluation.risk,
+                    " ".join(node_evaluation.warnings),
+                ))
+                if len(consumers) == 4:
+                    break
+            assistant_context = AssistantScanContext(
+                dirs_scanned=int(scanner.report.get("directories", 0)),
+                duration_ms=int(float(scanner.report.get("elapsed_seconds", 0)) * 1000),
+                free_bytes=usage.free,
+                total_bytes=usage.total,
+                biggest_consumers=tuple(consumers),
+            )
+            return scanner, root, evaluation, usage, inspection_roots, assistant_context
 
         self.scan_controller.start(scan_task)
         if self._scan_poll_source:
@@ -398,7 +513,8 @@ class Clearspace(Gtk.Application):
         if not result:
             self._finish_scan_error(RuntimeError("scanner returned no result"))
             return GLib.SOURCE_REMOVE
-        scanner, root, evaluation, usage, inspection_roots = result
+        scanner, root, evaluation, usage, inspection_roots, assistant_context = result
+        self.assistant_context = assistant_context
         report = dict(scanner.report)
         report["partial"] = bool(
             event.partial
@@ -417,7 +533,101 @@ class Clearspace(Gtk.Application):
         )
         if report["partial"]:
             self.partial_banner.set_visible(True)
+        self._update_assistant_greeting(assistant_context)
         return GLib.SOURCE_REMOVE
+
+    def _update_assistant_greeting(self, context: AssistantScanContext) -> None:
+        greeting = self.local_assistant.greeting(context)
+        self.assistant_greeting.set_text(greeting)
+
+    def _assistant_input_activated(self, entry) -> None:
+        self._submit_assistant_message(entry.get_text())
+
+    def _assistant_send_clicked(self, _button) -> None:
+        self._submit_assistant_message(self.assistant_input.get_text())
+
+    def _assistant_chip_clicked(self, _button, prompt: str) -> None:
+        self._submit_assistant_message(prompt)
+
+    def _assistant_context_for_selection(self) -> AssistantScanContext:
+        entry = self._detail_entry
+        selected_consumer = None
+        if entry and not entry.loading and not entry.node.aggregate_count:
+            evaluation = entry.evaluation or self.rule_engine.evaluate(entry.node)
+            entry.evaluation = evaluation
+            selected_consumer = ScanConsumer(
+                entry.node.path,
+                entry.node.name,
+                entry.node.size_bytes,
+                evaluation.risk,
+                " ".join(evaluation.warnings),
+            )
+        return AssistantScanContext(
+            dirs_scanned=self.assistant_context.dirs_scanned,
+            duration_ms=self.assistant_context.duration_ms,
+            free_bytes=self.assistant_context.free_bytes,
+            total_bytes=self.assistant_context.total_bytes,
+            biggest_consumers=self.assistant_context.biggest_consumers,
+            selected_consumer=selected_consumer,
+        )
+
+    def _submit_assistant_message(self, message: str) -> None:
+        prompt = message.strip()
+        if not prompt:
+            return
+        self.assistant_input.set_text("")
+        self._append_assistant_message("You", prompt)
+        reply = self.local_assistant.respond(
+            prompt, self._assistant_context_for_selection()
+        )
+        self._append_assistant_message("Assistant", reply.text)
+        self._handle_assistant_proposals(reply.proposed_actions)
+
+    def _append_assistant_message(self, speaker: str, message: str) -> None:
+        self.assistant_messages.append((speaker, message))
+        label = Gtk.Label(label=f"{speaker}: {message}", xalign=0, wrap=True)
+        label.set_selectable(True)
+        label.add_css_class("scan-chip")
+        self.assistant_message_box.append(label)
+        if len(self.assistant_messages) > 80:
+            self.assistant_messages.pop(0)
+            oldest = self.assistant_message_box.get_first_child()
+            if oldest is not None:
+                self.assistant_message_box.remove(oldest)
+        GLib.idle_add(self._scroll_assistant_messages)
+
+    def _scroll_assistant_messages(self):
+        adjustment = self.assistant_messages_scroll.get_vadjustment()
+        adjustment.set_value(max(
+            adjustment.get_lower(),
+            adjustment.get_upper() - adjustment.get_page_size(),
+        ))
+        return GLib.SOURCE_REMOVE
+
+    def _handle_assistant_proposals(self, proposals) -> None:
+        for proposal in proposals:
+            if proposal.kind is ProposedActionKind.HIGHLIGHT_NODE:
+                self._highlight_assistant_node(proposal.target)
+            elif (
+                proposal.kind is ProposedActionKind.OPEN_REVIEW
+                and self.selection
+                and self.selection.selected_paths
+            ):
+                self.review_selection(None)
+
+    def _highlight_assistant_node(self, target: str) -> None:
+        try:
+            path = Path(target)
+        except (TypeError, ValueError):
+            return
+        entry = self.entries.get(path)
+        if entry is None or not hasattr(self, "tree_model"):
+            return
+        for position in range(self.tree_model.get_n_items()):
+            row = self.tree_model.get_row(position)
+            if row and row.get_item() is entry:
+                self.tree_selection.set_selected(position)
+                return
 
     def _update_scanning_view(self, event: ProgressEvent):
         total = event.dirs_total_est
@@ -612,8 +822,7 @@ class Clearspace(Gtk.Application):
             node.selectable = False
         entry = TreeEntry(node, evaluation, parent_entry=parent_entry)
         entry.scanner = self.scanner
-        if node.selectable:
-            self.entries.setdefault(node.path, entry)
+        self.entries.setdefault(node.path, entry)
         return entry
 
     def _size_sorter(self):
@@ -878,8 +1087,14 @@ class Clearspace(Gtk.Application):
 
     def _show_details(self, entry: TreeEntry | None):
         self._detail_entry = entry
+        selected_name = (
+            entry.node.name
+            if entry and not entry.loading and not entry.node.aggregate_count
+            else "the selected item"
+        )
+        self.explain_risk_chip.set_label(f"Explain the risk of {selected_name}")
         if not entry or entry.loading:
-            self.detail_title.set_text("Selecione um item")
+            self.detail_title.set_text("Select an item")
             self.detail_size.set_text("")
             self.detail_path.set_text("")
             self.detail_warning.set_text("")
@@ -909,13 +1124,19 @@ class Clearspace(Gtk.Application):
         evaluation = entry.evaluation or self.rule_engine.evaluate(entry.node)
         entry.evaluation = evaluation
         warnings = "\n".join(f"• {warning}" for warning in evaluation.warnings)
-        self.detail_warning.set_text(f"Risco: {evaluation.risk.value}\n{warnings}")
+        risk_label = {
+            Risk.LOW: "Low",
+            Risk.MODERATE: "Moderate",
+            Risk.USER_DATA: "Your data",
+            Risk.CRITICAL: "Critical",
+        }[evaluation.risk]
+        self.detail_warning.set_text(f"Risk: {risk_label}\n{warnings}")
         procedure = evaluation.recommended_procedure
         self._detail_procedure_argv = None
         if procedure:
             self.detail_procedure.set_text(
-                f"Procedimento recomendado: {procedure.label}\n"
-                f"Efeito: {procedure.side_effects}"
+                f"Recommended procedure: {procedure.label}\n"
+                f"Effects: {procedure.side_effects}"
             )
             if procedure.requires_admin:
                 self._detail_procedure_argv = procedure.command_to_copy
@@ -923,7 +1144,7 @@ class Clearspace(Gtk.Application):
             else:
                 self.copy_procedure_button.set_visible(False)
         else:
-            self.detail_procedure.set_text("Nenhum procedimento nativo disponível.")
+            self.detail_procedure.set_text("No native procedure is available.")
             self.copy_procedure_button.set_visible(False)
         self.open_folder_button.set_sensitive(entry.node.is_dir and not entry.node.error)
 

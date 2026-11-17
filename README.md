@@ -49,6 +49,10 @@ Clearspace stores a structured, local JSONL action history at `~/.local/share/cl
 - A GTK-free rule engine classifies caches, builds, personal data, credentials, repositories,
   browser profiles, game data, and container volumes. It reports Git worktree changes and
   recommends installed native procedures; administrator procedures are copy-only.
+- The Results screen includes a local rule-based assistant summary and prompt chips.
+  Messages remain in memory for the current app session. Proposals can only highlight
+  a node or open a review for items the user already selected; they never change cleanup
+  checkboxes or execute actions. The assistant does not load a model or use the network.
 - File actions use a reviewed, one-item executor: Gio trash is the default, permanent
   removal requires typing a confirmation phrase, and critical-risk paths are blocked.
   Paths are revalidated against protected roots, active data, filesystem boundaries, and

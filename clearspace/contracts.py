@@ -164,6 +164,10 @@ class Procedure:
 
 
 class ProposedActionKind(StrEnum):
+    HIGHLIGHT_NODE = "highlight_node"
+    OPEN_REVIEW = "open_review"
+    # Retained for compatibility with other Assistant implementations. The
+    # Clearspace UI must never map these kinds to destructive state changes.
     SELECT_NODE = "select_node"
     OPEN_PROCEDURE = "open_procedure"
     EXPLAIN_RISK = "explain_risk"
