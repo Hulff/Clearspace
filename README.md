@@ -21,9 +21,12 @@ that screen; the app can switch back after the binary supports the scanner
 agnostic progress/control contract in protocol v2. `CLEARSPACE_SCAN_BIN` still
 selects a binary for the headless Rust adapter.
 
-Na primeira abertura, a árvore começa em `/home`, para mostrar as pastas de
-usuários diretamente. Caminhos de cada usuário e dados de aplicações ativas
-continuam sujeitos às proteções do executor.
+Na primeira abertura, Clearspace mostra o seletor de pasta com Home selecionada.
+Caches e Downloads aparecem como atalhos quando existem. A lista de pastas é
+somente para leitura; tamanhos só são calculados depois de iniciar a varredura.
+O usuário pode escolher outra pasta, incluir pastas ocultas ou limitar a busca
+ao filesystem selecionado. O último scan concluído fica no histórico local para
+consulta na linha Recent.
 
 GTK 4 and its Python bindings (`python-gobject`) are required. On Arch Linux, install them with `sudo pacman -S gtk4 python-gobject`.
 

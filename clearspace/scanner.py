@@ -40,6 +40,8 @@ class TreeScanner:
     _throttle: ProgressThrottle = field(default_factory=ProgressThrottle, init=False, repr=False)
     _started_at: float = field(default=0.0, init=False, repr=False)
     _dirs_done: int = field(default=0, init=False, repr=False)
+    _include_hidden: bool = field(default=True, init=False, repr=False)
+    _stay_on_device: bool = field(default=True, init=False, repr=False)
 
     def scan_root(
         self,
@@ -47,6 +49,8 @@ class TreeScanner:
         progress: Callable[[ProgressEvent], None] | None = None,
         cancel_event: threading.Event | None = None,
         pause_event: threading.Event | None = None,
+        include_hidden: bool = True,
+        stay_on_device: bool = True,
     ) -> Node:
         """Create the root node and measure every reachable directory."""
         started = time.monotonic()
@@ -54,6 +58,8 @@ class TreeScanner:
         self._progress = progress
         self._cancel_event = cancel_event
         self._pause_event = pause_event
+        self._include_hidden = include_hidden
+        self._stay_on_device = stay_on_device
         self._dirs_done = 0
         self._throttle = ProgressThrottle()
         self.top_items = TopKTracker()
@@ -66,6 +72,7 @@ class TreeScanner:
             "errors": 0,
             "symlinks_skipped": 0,
             "other_filesystems_skipped": 0,
+            "hidden_skipped": 0,
             "allocated_bytes": 0,
         }
         root_path = Path(os.path.abspath(self.root_path))
@@ -226,6 +233,9 @@ class TreeScanner:
                     if index % 64 == 0 and not self._checkpoint():
                         node.size_is_partial = True
                         break
+                    if not self._include_hidden and entry.name.startswith("."):
+                        self.report["hidden_skipped"] += 1
+                        continue
                     try:
                         info = entry.stat(follow_symlinks=False)
                     except OSError as error:
@@ -249,7 +259,7 @@ class TreeScanner:
                         # Symlink targets are never inspected or traversed.
                         self.report["symlinks_skipped"] += 1
                         continue
-                    if info.st_dev != self._root_device:
+                    if self._stay_on_device and info.st_dev != self._root_device:
                         self.report["other_filesystems_skipped"] += 1
                         continue
 
@@ -307,7 +317,7 @@ class TreeScanner:
             return Node(path, path.name, False, 0, error="symlink não seguido")
         if self._root_device is None:
             self._root_device = info.st_dev
-        if info.st_dev != self._root_device:
+        if self._stay_on_device and info.st_dev != self._root_device:
             return Node(path, path.name, stat.S_ISDIR(info.st_mode), 0,
                         error="filesystem diferente; ignorado")
 

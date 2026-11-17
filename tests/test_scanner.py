@@ -29,6 +29,21 @@ def test_scans_complete_tree_and_includes_hidden_entries(tmp_path: Path) -> None
     assert scanner.report["elapsed_seconds"] >= 0
 
 
+def test_can_exclude_hidden_entries_without_following_them(tmp_path: Path) -> None:
+    root_path = tmp_path / "root"
+    hidden = root_path / ".hidden"
+    hidden.mkdir(parents=True)
+    (hidden / "payload").write_bytes(b"hidden")
+    (root_path / "visible").write_bytes(b"visible")
+
+    scanner = TreeScanner(root_path)
+    root = scanner.scan_root(include_hidden=False)
+
+    assert [node.name for node in root.children] == ["visible"]
+    assert scanner.report["hidden_skipped"] == 1
+    assert scanner.report["files"] == 1
+
+
 def test_symlink_targets_are_not_followed(tmp_path: Path) -> None:
     root_path = tmp_path / "root"
     outside = tmp_path / "outside"

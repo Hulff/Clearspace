@@ -229,6 +229,45 @@ class History:
         with self.path.open("a", encoding="utf-8") as stream:
             stream.write(json.dumps(record, ensure_ascii=False, sort_keys=True) + "\n")
 
+    def record_scan(
+        self,
+        path: Path,
+        size_bytes: int,
+        *,
+        partial: bool = False,
+        timestamp: float | None = None,
+    ) -> None:
+        """Remember scan metadata locally without storing file contents."""
+        self.append({
+            "schema_version": 1,
+            "record_type": "scan",
+            "timestamp": time.time() if timestamp is None else timestamp,
+            "path": str(path),
+            "size_bytes": max(0, int(size_bytes)),
+            "partial": bool(partial),
+        })
+
+    def latest_scan(self) -> dict | None:
+        try:
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except FileNotFoundError:
+            return None
+        for line in reversed(lines):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if (
+                isinstance(record, dict)
+                and record.get("record_type") == "scan"
+                and isinstance(record.get("path"), str)
+                and isinstance(record.get("size_bytes"), int)
+                and record["size_bytes"] >= 0
+                and isinstance(record.get("timestamp"), (int, float))
+            ):
+                return record
+        return None
+
     def recent(self, limit: int = 8) -> list[dict]:
         try:
             lines = self.path.read_text(encoding="utf-8").splitlines()

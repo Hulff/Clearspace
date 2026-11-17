@@ -4,7 +4,9 @@
 from __future__ import annotations
 
 import shlex
+import os
 import resource
+import stat
 import threading
 import time
 from pathlib import Path
@@ -47,6 +49,15 @@ from clearspace.executor import (
     build_review,
     discover_active_paths,
 )
+from clearspace.locations import (
+    ScanOptions,
+    ScanRootError,
+    canonical_directory,
+    format_age,
+    resolve_xdg_locations,
+    scanner_arguments,
+    validate_scan_root,
+)
 from clearspace.rules import RuleEngine, RuleEvaluation
 from clearspace.scanner import TreeScanner
 
@@ -67,7 +78,7 @@ class TreeEntry(GObject.Object):
         self.evaluation = evaluation
         self.loading = loading
         self.parent_entry = parent_entry
-        self.children_store = Gio.ListStore.new(TreeEntry)
+        self.children_store = None
         self.children_model = None
         self.loading_children = False
         self.scanner = None
@@ -78,7 +89,10 @@ class Clearspace(Gtk.Application):
         super().__init__(application_id="org.clearspace.DiskCleanup")
         self.history = History()
         self.rule_engine = RuleEngine()
-        self.scan_root = Path("/home")
+        self.scan_root = Path(GLib.get_home_dir())
+        self.scan_options = ScanOptions()
+        self.chosen_scan_path = self.scan_root
+        self.browser_path = self.scan_root
         self.scanner: TreeScanner | None = None
         self.root_node: Node | None = None
         self.root_entry: TreeEntry | None = None
@@ -106,6 +120,8 @@ class Clearspace(Gtk.Application):
         self._window_is_narrow: bool | None = None
         self._auto_collapsed_for_width = False
         self._responsive_toggle = False
+        self._folder_listing_generation = 0
+        self._folder_rows = ()
 
     def do_activate(self):
         self.window = Gtk.ApplicationWindow(application=self, title="Clearspace")
@@ -114,6 +130,7 @@ class Clearspace(Gtk.Application):
         self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
         self.window.set_child(self.stack)
         self._build_scanning_screen()
+        self._build_folder_chooser()
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         outer.set_margin_top(20)
         outer.set_margin_bottom(16)
@@ -147,8 +164,8 @@ class Clearspace(Gtk.Application):
         outer.append(self.partial_banner)
 
         scan_bar = Gtk.Box(spacing=8)
-        self.scan_button = Gtk.Button(label="Atualizar árvore")
-        self.scan_button.connect("clicked", lambda *_: self.scan())
+        self.scan_button = Gtk.Button(label="Choose folder…")
+        self.scan_button.connect("clicked", self.show_folder_chooser)
         scan_bar.append(self.scan_button)
         self.scan_report_button = Gtk.Button(label="Relatório da varredura")
         self.scan_report_button.set_sensitive(False)
@@ -172,7 +189,7 @@ class Clearspace(Gtk.Application):
         tree_scroll = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
         tree_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         self.panes.set_start_child(tree_scroll)
-        self.tree_placeholder = Gtk.Label(label="Lendo /home…", xalign=0)
+        self.tree_placeholder = Gtk.Label(label="Loading folder…", xalign=0)
         tree_scroll.set_child(self.tree_placeholder)
 
         self.details = self._build_details_panel()
@@ -198,7 +215,8 @@ class Clearspace(Gtk.Application):
         footer.append(trash_note)
         outer.append(footer)
 
-        self.scan()
+        self.stack.set_visible_child_name("choose")
+        self._set_chosen_folder(self.scan_root, browse=True, quick_pick="home")
         self.window.present()
         self._responsive_poll_source = GLib.timeout_add(
             500, self._check_responsive_panel
@@ -220,6 +238,10 @@ class Clearspace(Gtk.Application):
         checkbutton { min-width: 40px; min-height: 40px; }
         entry { min-height: 40px; }
         .scan-current-path { font-family: monospace; color: #a9b0b3; }
+        .quick-pick, .ready-card, .folder-browser { background: #232627;
+            border: 1px solid #34383a; border-radius: 14px; padding: 14px; }
+        .folder-hidden { color: #e5b567; font-size: 0.85em; }
+        .folder-error, .error { color: #ff8b82; }
         .scan-chip { background: #1c1f20; border-radius: 8px; padding: 8px 10px; }
         .badge { border-radius: 999px; padding: 4px 9px; font-weight: 600; }
         .risk-low { background: #1f3a2a; color: #8fe0b0; }
@@ -322,6 +344,453 @@ class Clearspace(Gtk.Application):
         footnote.add_css_class("scan-muted")
         page.append(footnote)
         self.stack.add_named(page, "scanning")
+
+    def _build_folder_chooser(self):
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=18)
+        page.add_css_class("clearspace-root")
+        page.set_margin_top(28)
+        page.set_margin_bottom(24)
+        page.set_margin_start(30)
+        page.set_margin_end(30)
+
+        title = Gtk.Label(label="Where do you want to start?", xalign=0)
+        title.add_css_class("title-1")
+        page.append(title)
+        subtitle = Gtk.Label(
+            label="Pick a folder to scan. Smaller scans are faster and use less memory. Nothing is deleted.",
+            xalign=0,
+            wrap=True,
+        )
+        subtitle.add_css_class("scan-muted")
+        page.append(subtitle)
+
+        locations = resolve_xdg_locations(
+            home_dir=GLib.get_home_dir(),
+            cache_dir=GLib.get_user_cache_dir(),
+            downloads_dir=GLib.get_user_special_dir(
+                GLib.UserDirectory.DIRECTORY_DOWNLOAD
+            ),
+            config_dir=GLib.get_user_config_dir(),
+            environ=os.environ,
+        )
+        quick_specs = (
+            ("home", "Home", "Recommended", locations["home"]),
+            ("caches", "Caches", "Often safe to clean", locations["caches"]),
+            ("downloads", "Downloads", "Personal files", locations["downloads"]),
+        )
+        self.quick_pick_paths: dict[str, Path] = {}
+        self.quick_pick_buttons: dict[str, Gtk.ToggleButton] = {}
+        self._updating_quick_picks = False
+        quick_row = Gtk.Box(spacing=12)
+        for key, label, hint, raw_path in quick_specs:
+            if raw_path is None:
+                continue
+            path = Path(raw_path)
+            try:
+                info = path.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+                continue
+            self.quick_pick_paths[key] = path
+            card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=5)
+            name_label = Gtk.Label(label=label, xalign=0)
+            name_label.add_css_class("heading")
+            hint_label = Gtk.Label(label=hint, xalign=0)
+            hint_label.add_css_class("scan-muted")
+            path_label = Gtk.Label(label=str(path), xalign=0, ellipsize=2)
+            path_label.add_css_class("scan-muted")
+            card.append(name_label)
+            card.append(hint_label)
+            card.append(path_label)
+            button = Gtk.ToggleButton()
+            button.set_child(card)
+            button.add_css_class("quick-pick")
+            button.set_hexpand(True)
+            button.connect("toggled", self._quick_pick_toggled, key)
+            self._set_accessible_label(button, f"Scan {label}: {hint}")
+            self.quick_pick_buttons[key] = button
+            quick_row.append(button)
+        page.append(quick_row)
+
+        browser_and_ready = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=18, vexpand=True
+        )
+        page.append(browser_and_ready)
+
+        browser = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10, hexpand=True)
+        browser.add_css_class("folder-browser")
+        breadcrumb_scroll = Gtk.ScrolledWindow(hexpand=True)
+        breadcrumb_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.NEVER)
+        self.folder_breadcrumb = Gtk.Box(spacing=2)
+        breadcrumb_scroll.set_child(self.folder_breadcrumb)
+        browser.append(breadcrumb_scroll)
+
+        browser_controls = Gtk.Box(spacing=8)
+        self.folder_back_button = Gtk.Button(label="‹ Back")
+        self.folder_back_button.connect("clicked", self._folder_back_clicked)
+        self.folder_back_button.set_sensitive(False)
+        browser_controls.append(self.folder_back_button)
+        self.folder_open_button = Gtk.Button(label="Open ›")
+        self.folder_open_button.connect("clicked", self._open_selected_subfolder)
+        self.folder_open_button.set_sensitive(False)
+        browser_controls.append(self.folder_open_button)
+        self.choose_another_button = Gtk.Button(label="Choose another folder…")
+        self.choose_another_button.connect("clicked", self._choose_another_folder)
+        browser_controls.append(self.choose_another_button)
+        browser.append(browser_controls)
+
+        self.folder_status_label = Gtk.Label(label="", xalign=0, wrap=True)
+        self.folder_status_label.add_css_class("scan-muted")
+        browser.append(self.folder_status_label)
+        self.folder_strings = Gtk.StringList.new([])
+        self.folder_selection = Gtk.SingleSelection.new(self.folder_strings)
+        self.folder_selection.set_autoselect(False)
+        self.folder_selection.set_can_unselect(True)
+        self.folder_selection.connect(
+            "notify::selected", self._folder_selection_changed
+        )
+        folder_factory = Gtk.SignalListItemFactory.new()
+        folder_factory.connect("setup", self._folder_row_setup)
+        folder_factory.connect("bind", self._folder_row_bind)
+        self.folder_list = Gtk.ListView.new(self.folder_selection, folder_factory)
+        self.folder_list.set_single_click_activate(False)
+        self._set_accessible_label(self.folder_list, "Subfolders")
+        self.folder_list.connect("activate", self._folder_row_activated)
+        folder_scroll = Gtk.ScrolledWindow(vexpand=True)
+        folder_scroll.set_policy(Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+        folder_scroll.set_child(self.folder_list)
+        browser.append(folder_scroll)
+        browser_and_ready.append(browser)
+
+        ready = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        ready.set_size_request(320, -1)
+        ready.add_css_class("ready-card")
+        ready_title = Gtk.Label(label="Ready to scan", xalign=0)
+        ready_title.add_css_class("title-2")
+        ready.append(ready_title)
+        self.ready_path_label = Gtk.Label(label="", xalign=0, wrap=True, selectable=True)
+        ready.append(self.ready_path_label)
+        self.ready_space_label = Gtk.Label(label="", xalign=0, wrap=True)
+        self.ready_space_label.add_css_class("scan-muted")
+        ready.append(self.ready_space_label)
+        self.ready_error_label = Gtk.Label(label="", xalign=0, wrap=True)
+        self.ready_error_label.add_css_class("error")
+        ready.append(self.ready_error_label)
+
+        self.include_hidden_check = Gtk.CheckButton(label="Include hidden folders")
+        self.include_hidden_check.set_active(True)
+        self._set_accessible_label(
+            self.include_hidden_check, "Include hidden folders in the scan"
+        )
+        ready.append(self.include_hidden_check)
+        self.stay_on_disk_check = Gtk.CheckButton(label="Stay on this disk only")
+        self.stay_on_disk_check.set_active(True)
+        self._set_accessible_label(
+            self.stay_on_disk_check, "Stay on the selected filesystem"
+        )
+        ready.append(self.stay_on_disk_check)
+        self.start_scan_button = Gtk.Button(label="Start scan")
+        self.start_scan_button.add_css_class("suggested-action")
+        self.start_scan_button.set_sensitive(False)
+        self.start_scan_button.connect("clicked", self._start_selected_scan)
+        ready.append(self.start_scan_button)
+        self.recent_scan_label = Gtk.Label(label="Recent: no scans yet", xalign=0, wrap=True)
+        self.recent_scan_label.add_css_class("selection-note")
+        ready.append(self.recent_scan_label)
+        self.use_recent_button = Gtk.Button(label="Use recent folder")
+        self.use_recent_button.set_sensitive(False)
+        self.use_recent_button.connect("clicked", self._use_recent_scan)
+        ready.append(self.use_recent_button)
+        browser_and_ready.append(ready)
+
+        self._recent_scan = None
+        self._update_recent_scan_line()
+        self.stack.add_named(page, "choose")
+
+    def _quick_pick_toggled(self, button, key: str) -> None:
+        if self._updating_quick_picks or not button.get_active():
+            return
+        self._set_chosen_folder(
+            self.quick_pick_paths[key], browse=True, quick_pick=key
+        )
+
+    def _set_chosen_folder(
+        self,
+        path: Path,
+        *,
+        browse: bool,
+        quick_pick: str | None = None,
+    ) -> None:
+        self.chosen_scan_path = Path(path)
+        self._updating_quick_picks = True
+        try:
+            for key, button in self.quick_pick_buttons.items():
+                button.set_active(
+                    key == quick_pick
+                    or (quick_pick is None and self.quick_pick_paths[key] == self.chosen_scan_path)
+                )
+        finally:
+            self._updating_quick_picks = False
+        self._refresh_ready_panel()
+        if browse:
+            self._set_browser_folder(self.chosen_scan_path)
+
+    def _refresh_ready_panel(self) -> None:
+        self.ready_path_label.set_text(str(self.chosen_scan_path))
+        try:
+            canonical = validate_scan_root(self.chosen_scan_path)
+        except ScanRootError as error:
+            self.ready_error_label.set_text(str(error))
+            self.start_scan_button.set_sensitive(False)
+        else:
+            self.ready_error_label.set_text("")
+            self.start_scan_button.set_sensitive(True)
+            self.chosen_scan_path = canonical
+        try:
+            usage = os.statvfs(self.chosen_scan_path)
+            total = usage.f_blocks * usage.f_frsize
+            free = usage.f_bavail * usage.f_frsize
+            self.ready_space_label.set_text(
+                f"{format_bytes(free)} free of {format_bytes(total)} on this filesystem"
+            )
+        except OSError as error:
+            self.ready_space_label.set_text(
+                f"Filesystem space unavailable: {error.strerror or error}"
+            )
+
+    def _set_browser_folder(self, path: Path) -> None:
+        try:
+            canonical = canonical_directory(path)
+        except ScanRootError as error:
+            self.folder_status_label.set_text(str(error))
+            return
+        self.browser_path = canonical
+        self.folder_back_button.set_sensitive(canonical.parent != canonical)
+        self._render_folder_breadcrumb()
+        self._load_folder_listing(canonical)
+
+    def _render_folder_breadcrumb(self) -> None:
+        child = self.folder_breadcrumb.get_first_child()
+        while child is not None:
+            self.folder_breadcrumb.remove(child)
+            child = self.folder_breadcrumb.get_first_child()
+        parts = self.browser_path.parts
+        current = Path(parts[0])
+        for index, part in enumerate(parts):
+            if index:
+                self.folder_breadcrumb.append(Gtk.Label(label="/", xalign=0.5))
+                current = current / part
+            label = part if index else parts[0]
+            button = Gtk.Button(label=label)
+            button.set_tooltip_text(str(current))
+            button.connect("clicked", self._breadcrumb_clicked, current)
+            self.folder_breadcrumb.append(button)
+
+    def _breadcrumb_clicked(self, _button, path: Path) -> None:
+        self._set_chosen_folder(path, browse=True)
+
+    def _folder_back_clicked(self, _button) -> None:
+        parent = self.browser_path.parent
+        if parent != self.browser_path:
+            self._set_chosen_folder(parent, browse=True)
+
+    def _load_folder_listing(self, path: Path) -> None:
+        self._folder_listing_generation += 1
+        generation = self._folder_listing_generation
+        self._folder_rows = ()
+        self.folder_strings.splice(0, self.folder_strings.get_n_items(), [])
+        self.folder_open_button.set_sensitive(False)
+        self.folder_status_label.set_text("Loading folders…")
+        threading.Thread(
+            target=self._folder_listing_worker,
+            args=(generation, path),
+            name="clearspace-folder-list",
+            daemon=True,
+        ).start()
+
+    def _folder_listing_worker(self, generation: int, path: Path) -> None:
+        rows = []
+        error_message = None
+        try:
+            with os.scandir(path) as iterator:
+                for entry in iterator:
+                    try:
+                        info = entry.stat(follow_symlinks=False)
+                    except OSError as error:
+                        rows.append((
+                            entry.name,
+                            entry.path,
+                            entry.name.startswith("."),
+                            f"Cannot inspect: {error.strerror or error}",
+                        ))
+                        continue
+                    if not stat.S_ISDIR(info.st_mode):
+                        continue
+                    child_path = Path(entry.path)
+                    unreadable = None
+                    try:
+                        with os.scandir(child_path) as child_entries:
+                            next(child_entries, None)
+                    except OSError as error:
+                        unreadable = f"Cannot read: {error.strerror or error}"
+                    rows.append((entry.name, str(child_path), entry.name.startswith("."), unreadable))
+        except OSError as error:
+            error_message = f"Cannot list folders: {error.strerror or error}"
+        rows.sort(key=lambda row: row[0].casefold())
+        GLib.idle_add(
+            self._show_folder_listing,
+            generation,
+            path,
+            tuple(rows),
+            error_message,
+        )
+
+    def _show_folder_listing(self, generation, path, rows, error_message):
+        if generation != self._folder_listing_generation or path != self.browser_path:
+            return GLib.SOURCE_REMOVE
+        self._folder_rows = rows
+        self.folder_strings.splice(
+            0,
+            self.folder_strings.get_n_items(),
+            [name for name, _path, _hidden, _error in rows],
+        )
+        if error_message:
+            self.folder_status_label.set_text(error_message)
+        elif not rows:
+            self.folder_status_label.set_text("No subfolders here.")
+        else:
+            self.folder_status_label.set_text(
+                f"{len(rows):,} subfolders · hidden folders are tagged"
+            )
+        self.folder_selection.set_selected(Gtk.INVALID_LIST_POSITION)
+        self.folder_open_button.set_sensitive(False)
+        return GLib.SOURCE_REMOVE
+
+    def _folder_row_setup(self, _factory, list_item):
+        row = Gtk.Box(spacing=10)
+        icon = Gtk.Image.new_from_icon_name("folder-symbolic")
+        name = Gtk.Label(xalign=0, hexpand=True, ellipsize=2)
+        hidden = Gtk.Label(label="hidden")
+        hidden.add_css_class("folder-hidden")
+        reason = Gtk.Label(xalign=0)
+        reason.add_css_class("folder-error")
+        open_hint = Gtk.Label(label="Open ›")
+        open_hint.add_css_class("scan-muted")
+        row.append(icon)
+        row.append(name)
+        row.append(hidden)
+        row.append(reason)
+        row.append(open_hint)
+        list_item.set_child(row)
+        row._clearspace_folder_widgets = (icon, name, hidden, reason, open_hint)
+
+    def _folder_row_bind(self, _factory, list_item):
+        position = list_item.get_position()
+        if position < 0 or position >= len(self._folder_rows):
+            return
+        folder_name, folder_path, hidden_value, error = self._folder_rows[position]
+        icon, name, hidden, reason, open_hint = list_item.get_child()._clearspace_folder_widgets
+        name.set_text(folder_name)
+        hidden.set_visible(hidden_value)
+        reason.set_text(error or "")
+        reason.set_visible(bool(error))
+        open_hint.set_visible(not error)
+        list_item.set_selectable(not error)
+        list_item.set_activatable(not error)
+        list_item.set_accessible_label(folder_name)
+        list_item.set_accessible_description(error or str(folder_path))
+        list_item.get_child().set_sensitive(not error)
+
+    def _folder_selection_changed(self, selection, _property):
+        position = selection.get_selected()
+        if position == Gtk.INVALID_LIST_POSITION or position >= len(self._folder_rows):
+            self.folder_open_button.set_sensitive(False)
+            return
+        name, path, _hidden, error = self._folder_rows[position]
+        self.folder_open_button.set_sensitive(not error)
+        if not error:
+            self._set_chosen_folder(Path(path), browse=False)
+
+    def _folder_row_activated(self, _list_view, position):
+        self._open_folder_row(position)
+
+    def _open_selected_subfolder(self, _button):
+        self._open_folder_row(self.folder_selection.get_selected())
+
+    def _open_folder_row(self, position: int) -> None:
+        if position < 0 or position >= len(self._folder_rows):
+            return
+        _name, path, _hidden, error = self._folder_rows[position]
+        if error:
+            return
+        self._set_chosen_folder(Path(path), browse=True)
+
+    def _choose_another_folder(self, _button) -> None:
+        dialog = Gtk.FileDialog.new()
+        dialog.set_title("Choose a folder to scan")
+        try:
+            dialog.set_initial_folder(Gio.File.new_for_path(str(self.browser_path)))
+        except GLib.Error:
+            pass
+        dialog.select_folder(self.window, None, self._folder_dialog_finished, None)
+
+    def _folder_dialog_finished(self, dialog, result, _data) -> None:
+        try:
+            folder = dialog.select_folder_finish(result)
+        except GLib.Error:
+            return
+        path = folder.get_path()
+        if path:
+            self._set_chosen_folder(Path(path), browse=True)
+
+    def _start_selected_scan(self, _button) -> None:
+        try:
+            root = validate_scan_root(self.chosen_scan_path)
+        except ScanRootError as error:
+            self.ready_error_label.set_text(str(error))
+            self.start_scan_button.set_sensitive(False)
+            return
+        options = ScanOptions(
+            include_hidden=self.include_hidden_check.get_active(),
+            stay_on_disk_only=self.stay_on_disk_check.get_active(),
+        )
+        self.scan(root, options)
+
+    def _update_recent_scan_line(self) -> None:
+        try:
+            self._recent_scan = self.history.latest_scan()
+        except OSError as error:
+            self._recent_scan = None
+            self.recent_scan_label.set_text(
+                f"Recent scan history unavailable: {error.strerror or error}"
+            )
+            self.use_recent_button.set_sensitive(False)
+            return
+        record = self._recent_scan
+        if record is None:
+            self.recent_scan_label.set_text("Recent: no scans yet")
+            self.use_recent_button.set_sensitive(False)
+            return
+        age = format_age(time.time() - float(record["timestamp"]))
+        partial = " · partial" if record.get("partial") else ""
+        self.recent_scan_label.set_text(
+            f"Recent: {record['path']} · {age} · "
+            f"{format_bytes(record['size_bytes'])}{partial}"
+        )
+        try:
+            validate_scan_root(record["path"])
+        except ScanRootError:
+            self.use_recent_button.set_sensitive(False)
+        else:
+            self.use_recent_button.set_sensitive(True)
+
+    def _use_recent_scan(self, _button) -> None:
+        if self._recent_scan:
+            self._set_chosen_folder(Path(self._recent_scan["path"]), browse=True)
+
+    def show_folder_chooser(self, _button=None) -> None:
+        self.stack.set_visible_child_name("choose")
 
     @staticmethod
     def _set_accessible_label(widget, label):
@@ -478,7 +947,16 @@ class Clearspace(Gtk.Application):
                 self._responsive_toggle = False
         return GLib.SOURCE_CONTINUE
 
-    def scan(self):
+    def scan(self, root: Path | None = None, options: ScanOptions | None = None):
+        try:
+            scan_root = validate_scan_root(root or self.scan_root)
+        except ScanRootError as error:
+            self.stack.set_visible_child_name("choose")
+            self.ready_error_label.set_text(str(error))
+            return
+        scan_options = options or self.scan_options
+        self.scan_root = scan_root
+        self.scan_options = scan_options
         self._scan_generation += 1
         self._scan_started_at = time.monotonic()
         self._scan_eta = EtaEstimator()
@@ -486,7 +964,7 @@ class Clearspace(Gtk.Application):
         self._scan_last_top_render = 0.0
         self.stack.set_visible_child_name("scanning")
         self.scan_subtitle.set_text(
-            f"{self.scan_root} · Everything stays on your computer and nothing is deleted."
+            f"{scan_root} · Everything stays on your computer and nothing is deleted."
         )
         self.scan_counter_label.set_text("0 / estimating folders")
         self.scan_percent_label.set_text("")
@@ -496,7 +974,7 @@ class Clearspace(Gtk.Application):
         self.scan_elapsed_value.set_text("0:00")
         self.scan_eta_value.set_text("Calculating…")
         self.scan_eta_value.set_visible(False)
-        self.scan_path_label.set_text(f"Now scanning: {self.scan_root}")
+        self.scan_path_label.set_text(f"Now scanning: {scan_root}")
         self._render_biggest_so_far()
         self.scan_pause_button.set_label("Pause")
         self.scan_pause_button.set_sensitive(True)
@@ -508,7 +986,7 @@ class Clearspace(Gtk.Application):
         self.review_button.set_sensitive(False)
         if hasattr(self, "tree_view"):
             self.tree_view.set_sensitive(False)
-        self.disk_label.set_text(f"Scanning {self.scan_root}…")
+        self.disk_label.set_text(f"Scanning {scan_root}…")
         self.scan_report_button.set_sensitive(False)
         self.partial_banner.set_visible(False)
         self.scan_controller = ScanController()
@@ -523,15 +1001,16 @@ class Clearspace(Gtk.Application):
                 }:
                     publish(event)
 
-            scanner = TreeScanner(self.scan_root)
+            scanner = TreeScanner(scan_root)
             root = scanner.scan_root(
                 progress=publish_live_progress,
                 cancel_event=cancel_event,
                 pause_event=pause_event,
+                **scanner_arguments(scan_options),
             )
             evaluation = self.rule_engine.evaluate(root)
-            inspection_roots = inspection_only_paths(self.scan_root)
-            usage = shutil.disk_usage(self.scan_root)
+            inspection_roots = inspection_only_paths(scan_root)
+            usage = shutil.disk_usage(scan_root)
             consumers = []
             for node in root.children:
                 if node.aggregate_count:
@@ -592,6 +1071,17 @@ class Clearspace(Gtk.Application):
             report,
             None,
         )
+        try:
+            self.history.record_scan(
+                self.scan_root,
+                root.size_bytes,
+                partial=report["partial"],
+            )
+            self._update_recent_scan_line()
+        except OSError as error:
+            self.recent_scan_label.set_text(
+                f"Could not save scan history: {error.strerror or error}"
+            )
         if report["partial"]:
             self.partial_banner.set_visible(True)
         self._update_assistant_greeting(assistant_context)
@@ -858,8 +1348,8 @@ class Clearspace(Gtk.Application):
             f"Construção do modelo GTK: {report.get('gtk_model_build_seconds', 0):.3f} s\n"
             f"Tempo até a árvore ser mapeada: "
             f"{report.get('time_to_tree_mapped_seconds', 'aguardando UI')} s\n"
-            f"Tempo até os itens de /home aparecerem: "
-            f"{report.get('time_to_home_children_seconds', 'aguardando UI')} s\n"
+            f"Tempo até os itens da raiz aparecerem: "
+            f"{report.get('time_to_root_children_seconds', 'aguardando UI')} s\n"
             f"Pico de memória Python: "
             f"{report.get('python_peak_rss_kib', 0) / 1024:.1f} MiB\n"
             f"Diretórios lidos: {report.get('directories', 0)}\n"
@@ -867,6 +1357,7 @@ class Clearspace(Gtk.Application):
             f"Erros de leitura: {report.get('errors', 0)}\n"
             f"Symlinks ignorados: {report.get('symlinks_skipped', 0)}\n"
             f"Outros filesystems ignorados: {report.get('other_filesystems_skipped', 0)}\n"
+            f"Itens ocultos ignorados: {report.get('hidden_skipped', 0)}\n"
             f"Uso alocado encontrado: {format_bytes(report.get('allocated_bytes', 0))}\n\n"
             "Relatório agregado, sem nomes de arquivos ou conteúdo pessoal."
         )
@@ -911,6 +1402,8 @@ class Clearspace(Gtk.Application):
             return None
         if entry.children_model is not None:
             return entry.children_model
+        if entry.children_store is None:
+            entry.children_store = Gio.ListStore.new(TreeEntry)
         entry.children_model = Gtk.SortListModel.new(entry.children_store, self._size_sorter())
         if not entry.loading_children:
             entry.loading_children = True
@@ -948,7 +1441,7 @@ class Clearspace(Gtk.Application):
                     self._new_entry(node, evaluation, parent_entry=entry)
                 )
         if entry.node.path == self.scan_root and not error:
-            self.scan_report["time_to_home_children_seconds"] = round(
+            self.scan_report["time_to_root_children_seconds"] = round(
                 time.monotonic() - self._scan_started_at, 3
             )
             self.scan_report["python_peak_rss_kib"] = resource.getrusage(
