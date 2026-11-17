@@ -22,6 +22,47 @@ struct Counts {
     other_filesystems_skipped: u64,
     allocated_bytes: u64,
     first_progress_ms: Option<u128>,
+    dirs_done: u64,
+    current_path: String,
+    largest_items: Vec<LargestItem>,
+}
+
+#[derive(Clone)]
+struct LargestItem {
+    name: String,
+    path: String,
+    bytes: u64,
+}
+
+fn record_largest(items: &mut Vec<LargestItem>, item: LargestItem) {
+    items.push(item);
+    items.sort_by(|left, right| {
+        right
+            .bytes
+            .cmp(&left.bytes)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    items.truncate(4);
+}
+
+fn directory_estimate(done: u64, queued: u64) -> u64 {
+    done.saturating_add(queued)
+}
+
+fn largest_json(items: &[LargestItem]) -> String {
+    let entries = items
+        .iter()
+        .map(|item| {
+            format!(
+                "{{\"name\":\"{}\",\"path\":\"{}\",\"bytes\":{}}}",
+                json_escape(&item.name),
+                json_escape(&item.path),
+                item.bytes
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("[{entries}]")
 }
 
 struct TempDatabase(PathBuf);
@@ -35,7 +76,7 @@ impl Drop for TempDatabase {
 fn emit(event: &str, fields: &str) -> io::Result<()> {
     writeln!(
         io::stdout().lock(),
-        "{{\"protocol_version\":1,\"event\":\"{event}\"{fields}}}"
+        "{{\"protocol_version\":2,\"event\":\"{event}\"{fields}}}"
     )?;
     io::stdout().flush()
 }
@@ -81,7 +122,13 @@ fn parse_args() -> Result<(PathBuf, PathBuf, Vec<PathBuf>, bool, bool), String> 
             return Err(format!("unknown argument: {}", arg.to_string_lossy()));
         }
     }
-    Ok((root, db.ok_or("--db is required")?, excludes, include_hidden, stay_on_device))
+    Ok((
+        root,
+        db.ok_or("--db is required")?,
+        excludes,
+        include_hidden,
+        stay_on_device,
+    ))
 }
 
 struct NodeRow<'a> {
@@ -266,8 +313,11 @@ fn process(
     let skipped_mounts_cb = Arc::clone(&skipped_mounts);
     let skipped_symlinks = Arc::new(AtomicU64::new(0));
     let skipped_symlinks_cb = Arc::clone(&skipped_symlinks);
+    let discovered_directories = Arc::new(AtomicU64::new(1));
+    let discovered_for_cb = Arc::clone(&discovered_directories);
     let excluded_cb = Arc::new(excludes);
     let excluded_for_cb = Arc::clone(&excluded_cb);
+    let root_for_cb = root.clone();
     let walker = WalkDir::new(&root)
         .skip_hidden(!include_hidden)
         .follow_links(false)
@@ -291,13 +341,19 @@ fn process(
                         entry.read_children_path = None;
                         false
                     }
-                    Ok(_) => true,
+                    Ok(meta) => {
+                        if meta.is_dir() && path != root_for_cb {
+                            discovered_for_cb.fetch_add(1, Ordering::Relaxed);
+                        }
+                        true
+                    }
                     Err(_) => true,
                 }
             });
         });
     let progress_started = Instant::now();
     let mut batch = 0u64;
+    counts.current_path = root.to_string_lossy().into_owned();
     for item in walker.try_into_iter().map_err(|e| format!("walker: {e}"))? {
         let entry = match item {
             Ok(entry) => entry,
@@ -335,6 +391,8 @@ fn process(
             }
         };
         if entry.depth() == 0 {
+            counts.dirs_done = counts.dirs_done.saturating_add(1);
+            counts.current_path = root.to_string_lossy().into_owned();
             if let Some(error) = &entry.read_children_error {
                 counts.errors += 1;
                 conn.execute(
@@ -346,6 +404,7 @@ fn process(
             continue;
         }
         let path = entry.path();
+        counts.current_path = path.to_string_lossy().into_owned();
         let traversal_error = entry
             .read_children_error
             .as_ref()
@@ -415,8 +474,19 @@ fn process(
             .saturating_add(blocks.saturating_mul(512));
         if is_dir {
             counts.directories += 1;
+            counts.dirs_done = counts.dirs_done.saturating_add(1);
         } else {
             counts.files += 1;
+            if metadata.is_file() {
+                record_largest(
+                    &mut counts.largest_items,
+                    LargestItem {
+                        name: name.to_string(),
+                        path: path.to_string_lossy().into_owned(),
+                        bytes: blocks.saturating_mul(512),
+                    },
+                );
+            }
         }
         batch += 1;
         if batch >= 1000 {
@@ -425,11 +495,21 @@ fn process(
             }
             conn.execute_batch("COMMIT; BEGIN IMMEDIATE")
                 .map_err(|e| format!("commit batch: {e}"))?;
+            let dirs_total_est = discovered_directories.load(Ordering::Relaxed);
+            let dirs_queued = dirs_total_est.saturating_sub(counts.dirs_done);
             emit(
                 "progress",
                 &format!(
-                    ",\"directories\":{},\"files\":{},\"errors\":{},\"allocated_bytes\":{}",
-                    counts.directories, counts.files, counts.errors, counts.allocated_bytes
+                    ",\"directories\":{},\"dirs_done\":{},\"dirs_queued\":{},\"dirs_total_est\":{},\"files\":{},\"errors\":{},\"allocated_bytes\":{},\"current_path\":\"{}\",\"largest_items\":{}",
+                    counts.directories,
+                    counts.dirs_done,
+                    dirs_queued,
+                    directory_estimate(counts.dirs_done, dirs_queued),
+                    counts.files,
+                    counts.errors,
+                    counts.allocated_bytes,
+                    json_escape(&counts.current_path),
+                    largest_json(&counts.largest_items)
                 ),
             )
             .map_err(|e| e.to_string())?;
@@ -444,6 +524,7 @@ fn process(
         .map_err(|error| format!("compute child counts: {error}"))?;
     counts.other_filesystems_skipped = skipped_mounts.load(Ordering::Relaxed);
     counts.symlinks_skipped = skipped_symlinks.load(Ordering::Relaxed);
+    counts.dirs_done = discovered_directories.load(Ordering::Relaxed);
     conn.execute_batch("DROP TABLE scan_paths; CREATE INDEX nodes_parent_size_idx ON nodes(parent_id,size_blocks DESC,name COLLATE BINARY ASC); COMMIT;")
         .map_err(|e|format!("finalize database: {e}"))?;
     drop(conn);
@@ -472,20 +553,36 @@ fn main() {
     }
     match process(&root, &db, &excludes, include_hidden, stay_on_device) {
         Ok((c, root_id)) => {
+            let final_progress = format!(
+                ",\"directories\":{},\"dirs_done\":{},\"dirs_queued\":0,\"dirs_total_est\":{},\"files\":{},\"errors\":{},\"allocated_bytes\":{},\"current_path\":\"{}\",\"largest_items\":{}",
+                c.directories,
+                c.dirs_done,
+                directory_estimate(c.dirs_done, 0),
+                c.files,
+                c.errors,
+                c.allocated_bytes,
+                json_escape(&c.current_path),
+                largest_json(&c.largest_items),
+            );
+            let _ = emit("progress", &final_progress);
             let first_progress_ms = c
                 .first_progress_ms
                 .map_or_else(|| "null".to_owned(), |value| value.to_string());
             let fields = format!(
-                ",\"root_id\":{root_id},\"nodes\":{},\"directories\":{},\"dirs\":{},\"files\":{},\"errors\":{},\"symlinks_skipped\":{},\"other_filesystems_skipped\":{},\"allocated_bytes\":{},\"bytes\":{},\"first_progress_ms\":{},\"duration_ms\":{}",
+                ",\"root_id\":{root_id},\"nodes\":{},\"directories\":{},\"dirs\":{},\"dirs_done\":{},\"dirs_queued\":0,\"dirs_total_est\":{},\"files\":{},\"errors\":{},\"symlinks_skipped\":{},\"other_filesystems_skipped\":{},\"allocated_bytes\":{},\"bytes\":{},\"current_path\":\"{}\",\"largest_items\":{},\"first_progress_ms\":{},\"duration_ms\":{}",
                 c.nodes,
                 c.directories,
                 c.directories,
+                c.dirs_done,
+                c.dirs_done,
                 c.files,
                 c.errors,
                 c.symlinks_skipped,
                 c.other_filesystems_skipped,
                 c.allocated_bytes,
                 c.allocated_bytes,
+                json_escape(&c.current_path),
+                largest_json(&c.largest_items),
                 first_progress_ms,
                 started.elapsed().as_millis()
             );
@@ -509,6 +606,38 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn directory_estimate_is_completed_plus_queued() {
+        assert_eq!(directory_estimate(12, 5), 17);
+        assert_eq!(directory_estimate(u64::MAX, 1), u64::MAX);
+    }
+
+    #[test]
+    fn largest_items_are_bounded_and_sorted_by_allocated_size() {
+        let mut items = Vec::new();
+        for (path, bytes) in [("c", 3), ("a", 8), ("d", 4), ("b", 8), ("e", 2)] {
+            record_largest(
+                &mut items,
+                LargestItem {
+                    name: path.to_owned(),
+                    path: path.to_owned(),
+                    bytes,
+                },
+            );
+        }
+        assert_eq!(items.len(), 4);
+        assert_eq!(
+            items.iter().map(|item| item.bytes).collect::<Vec<_>>(),
+            [8, 8, 4, 3]
+        );
+        assert_eq!(items[0].path, "a");
+    }
+
+    #[test]
+    fn json_escaping_preserves_non_ascii_and_escapes_quotes() {
+        assert_eq!(json_escape("quote-\"-café"), "quote-\\\"-café");
+    }
 
     struct TempTree(PathBuf);
     impl TempTree {

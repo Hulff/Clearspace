@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import heapq
+import os
 import threading
 import time
 from dataclasses import dataclass, replace
@@ -19,6 +20,15 @@ class ScanState(StrEnum):
     ERROR = "error"
 
 
+class StatVfsInfo(Protocol):
+    f_frsize: int
+    f_bsize: int
+    f_blocks: int
+    f_bfree: int
+    f_files: int
+    f_ffree: int
+
+
 @dataclass(frozen=True, slots=True)
 class ProgressEvent:
     dirs_done: int = 0
@@ -30,6 +40,11 @@ class ProgressEvent:
     state: ScanState = ScanState.RUNNING
     partial: bool = False
     largest_items: tuple[tuple[str, str, int], ...] = ()
+    fs_used_bytes: int | None = None
+    fs_total_bytes: int | None = None
+    fs_used_inodes: int | None = None
+    filesystem_error: str | None = None
+    root_is_mountpoint: bool = False
 
     def __post_init__(self) -> None:
         for name in ("dirs_done", "files", "bytes", "elapsed_ms"):
@@ -37,6 +52,12 @@ class ProgressEvent:
                 raise ValueError(f"{name} cannot be negative")
         if self.dirs_total_est is not None and self.dirs_total_est < 0:
             raise ValueError("dirs_total_est cannot be negative")
+        for name in ("fs_used_bytes", "fs_total_bytes", "fs_used_inodes"):
+            value = getattr(self, name)
+            if value is not None and value < 0:
+                raise ValueError(f"{name} cannot be negative")
+        if self.filesystem_error is not None and not isinstance(self.filesystem_error, str):
+            raise ValueError("filesystem_error must be a string or None")
         if len(self.largest_items) > 4:
             raise ValueError("largest_items cannot contain more than four entries")
         if any(
@@ -154,10 +175,32 @@ class ScanController:
         return self._error
 
 
-def progress_percent(event: ProgressEvent) -> int | None:
-    """Return None for indeterminate progress and cap active scans at 99%."""
+def filesystem_stats(
+    path: Path,
+    statvfs: Callable[[Path], StatVfsInfo] = os.statvfs,
+) -> tuple[int, int, int]:
+    """Return used bytes, total bytes, and used inodes from local statvfs."""
+    info = statvfs(path)
+    block_size = info.f_frsize or info.f_bsize
+    total_bytes = max(0, info.f_blocks) * block_size
+    used_blocks = max(0, info.f_blocks - info.f_bfree)
+    used_inodes = max(0, info.f_files - info.f_ffree)
+    return used_blocks * block_size, total_bytes, used_inodes
+
+
+def progress_percent(
+    event: ProgressEvent,
+    *,
+    root_is_mountpoint: bool = False,
+) -> int | None:
+    """Return mount usage or folder-estimate progress, capped at 99% while running."""
     if event.state is ScanState.DONE:
         return 100
+    if root_is_mountpoint:
+        used = event.fs_used_bytes
+        if used is None or used <= 0:
+            return None
+        return min(99, max(0, event.bytes * 100 // used))
     total = event.dirs_total_est
     if total is None or total <= 0:
         return None

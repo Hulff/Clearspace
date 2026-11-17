@@ -2,6 +2,11 @@ from __future__ import annotations
 
 import threading
 import time
+from types import SimpleNamespace
+from pathlib import Path
+
+import pytest
+import clearspace.progress as progress_module
 
 from clearspace.progress import (
     EtaEstimator,
@@ -115,3 +120,91 @@ def test_scan_controller_pause_resume_cancel_keeps_partial_result() -> None:
 def test_progress_formatting() -> None:
     assert format_size_gib(1024**3) == "1.0 GiB"
     assert format_elapsed(65_999) == "1:05"
+
+
+def test_filesystem_stats_uses_statvfs_block_and_inode_counts(tmp_path: Path) -> None:
+    fake_statvfs = SimpleNamespace(
+        f_frsize=4096,
+        f_bsize=1024,
+        f_blocks=100,
+        f_bfree=25,
+        f_files=20,
+        f_ffree=7,
+    )
+
+    filesystem_stats = _required_filesystem_stats()
+    result = filesystem_stats(tmp_path, statvfs=lambda _path: fake_statvfs)
+
+    assert result == (307_200, 409_600, 13)
+
+
+def test_filesystem_stats_falls_back_to_block_size_and_clamps_negative_counts(
+    tmp_path: Path,
+) -> None:
+    fake_statvfs = SimpleNamespace(
+        f_frsize=0,
+        f_bsize=2048,
+        f_blocks=10,
+        f_bfree=12,
+        f_files=4,
+        f_ffree=8,
+    )
+
+    filesystem_stats = _required_filesystem_stats()
+    result = filesystem_stats(tmp_path, statvfs=lambda _path: fake_statvfs)
+
+    assert result == (0, 20_480, 0)
+
+
+def test_filesystem_stats_keeps_statvfs_errors_visible(tmp_path: Path) -> None:
+    def failing_statvfs(_path: Path):
+        raise PermissionError("statvfs denied")
+
+    filesystem_stats = _required_filesystem_stats()
+    with pytest.raises(PermissionError, match="statvfs denied"):
+        filesystem_stats(tmp_path, statvfs=failing_statvfs)
+
+
+def test_mount_root_progress_uses_filesystem_used_bytes_and_caps_at_99() -> None:
+    event = ProgressEvent()
+    assert hasattr(event, "fs_used_bytes"), "ProgressEvent must carry filesystem usage"
+    assert progress_percent(
+        ProgressEvent(bytes=80, fs_used_bytes=100), root_is_mountpoint=True
+    ) == 80
+    assert progress_percent(
+        ProgressEvent(bytes=120, fs_used_bytes=100), root_is_mountpoint=True
+    ) == 99
+    assert progress_percent(
+        ProgressEvent(bytes=1, fs_used_bytes=0), root_is_mountpoint=True
+    ) is None
+    assert progress_percent(
+        ProgressEvent(state=ScanState.DONE, fs_used_bytes=100),
+        root_is_mountpoint=True,
+    ) == 100
+
+
+def test_subfolder_progress_uses_directory_estimate_not_filesystem_ceiling() -> None:
+    event = ProgressEvent()
+    assert hasattr(event, "fs_total_bytes"), "ProgressEvent must carry filesystem context"
+    event = ProgressEvent(
+        dirs_done=25,
+        dirs_total_est=100,
+        bytes=900,
+        fs_used_bytes=1_000,
+        fs_total_bytes=2_000,
+    )
+
+    assert progress_percent(event, root_is_mountpoint=False) == 25
+
+
+def test_progress_event_can_expose_statvfs_failure() -> None:
+    event = ProgressEvent()
+    assert hasattr(event, "filesystem_error"), "statvfs errors must remain visible"
+    event = ProgressEvent(filesystem_error="statvfs denied")
+    assert event.filesystem_error == "statvfs denied"
+
+
+def _required_filesystem_stats():
+    function = getattr(progress_module, "filesystem_stats", None)
+    assert callable(function), "filesystem_stats must derive capacity from statvfs"
+    return function

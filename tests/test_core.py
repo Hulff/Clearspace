@@ -68,3 +68,51 @@ def test_missing_target_is_reported(tmp_path: Path) -> None:
     assert result.bytes == 0
     assert result.missing
     assert result.errors
+
+
+def test_scan_history_stores_directory_count_and_matches_canonical_root(tmp_path: Path) -> None:
+    from clearspace.core import History
+    import inspect
+
+    assert hasattr(History, "latest_scan_for"), "same-root scan lookup is missing"
+    assert "directories" in inspect.signature(History.record_scan).parameters
+
+    root = tmp_path / "scan-root"
+    root.mkdir()
+    history = History(tmp_path / "history.jsonl")
+    history.record_scan(root / ".." / "scan-root", 100, directories=7, timestamp=1)
+
+    assert history.latest_scan_for(root.resolve()) == {
+        "schema_version": 1,
+        "record_type": "scan",
+        "timestamp": 1,
+        "path": str(root / ".." / "scan-root"),
+        "size_bytes": 100,
+        "partial": False,
+        "directories": 7,
+    }
+
+
+def test_scan_history_ignores_partial_and_legacy_directory_estimates(tmp_path: Path) -> None:
+    from clearspace.core import History
+    import inspect
+
+    assert hasattr(History, "latest_scan_for"), "same-root scan lookup is missing"
+    assert "directories" in inspect.signature(History.record_scan).parameters
+
+    root = tmp_path / "scan-root"
+    root.mkdir()
+    history = History(tmp_path / "history.jsonl")
+    history.record_scan(root, 100, directories=5, timestamp=1)
+    history.record_scan(root, 200, directories=9, partial=True, timestamp=2)
+    history.append({
+        "schema_version": 1,
+        "record_type": "scan",
+        "timestamp": 3,
+        "path": str(root),
+        "size_bytes": 300,
+        "partial": False,
+    })
+
+    assert history.latest_scan_for(root) is not None
+    assert history.latest_scan_for(root)["directories"] == 5

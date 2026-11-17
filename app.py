@@ -10,6 +10,7 @@ import stat
 import threading
 import time
 from collections import OrderedDict
+from dataclasses import replace
 from pathlib import Path
 
 import gi
@@ -39,6 +40,7 @@ from clearspace.progress import (
     ScanState,
     format_elapsed,
     format_size_gib,
+    filesystem_stats,
     progress_percent,
 )
 from clearspace.executor import (
@@ -61,7 +63,11 @@ from clearspace.locations import (
     validate_scan_root,
 )
 from clearspace.rules import RuleEngine, RuleEvaluation
-from clearspace.rust_scanner import RustScannerError, RustTreeScanner
+from clearspace.rust_scanner import (
+    RustScannerError,
+    RustTreeScanner,
+    progress_event_from_rust,
+)
 
 
 def _bounded_setting(name: str, default: int, minimum: int) -> int:
@@ -1015,6 +1021,27 @@ class Clearspace(Gtk.Application):
         def scan_task(publish, cancel_event, pause_event):
             import shutil
 
+            filesystem_error = None
+            try:
+                fs_used_bytes, fs_total_bytes, fs_used_inodes = filesystem_stats(scan_root)
+            except OSError as error:
+                fs_used_bytes = fs_total_bytes = fs_used_inodes = None
+                filesystem_error = error.strerror or str(error)
+            root_is_mountpoint = scan_root.is_mount()
+            previous_scan = self.history.latest_scan_for(scan_root)
+            prior_directories = (
+                previous_scan.get("directories") if previous_scan is not None else None
+            )
+            publish(ProgressEvent(
+                dirs_total_est=prior_directories,
+                current_path=str(scan_root),
+                fs_used_bytes=fs_used_bytes,
+                fs_total_bytes=fs_total_bytes,
+                fs_used_inodes=fs_used_inodes,
+                filesystem_error=filesystem_error,
+                root_is_mountpoint=root_is_mountpoint,
+            ))
+
             if not RustTreeScanner.available():
                 raise RustScannerError(
                     "The SQLite scanner is unavailable. Build it with cargo build --release --manifest-path scanner/Cargo.toml."
@@ -1022,15 +1049,18 @@ class Clearspace(Gtk.Application):
             started = time.monotonic()
 
             def publish_live_progress(event: dict) -> None:
-                publish(ProgressEvent(
-                    dirs_done=int(event.get("directories", 0)),
-                    dirs_total_est=None,
-                    files=int(event.get("files", 0)),
-                    bytes=int(event.get("allocated_bytes", 0)),
+                progress = progress_event_from_rust(
+                    event,
                     elapsed_ms=int((time.monotonic() - started) * 1000),
-                    current_path=str(scan_root),
-                    state=ScanState.RUNNING,
-                    partial=bool(event.get("errors", 0)),
+                    prior_directories=prior_directories,
+                )
+                publish(replace(
+                    progress,
+                    fs_used_bytes=fs_used_bytes,
+                    fs_total_bytes=fs_total_bytes,
+                    fs_used_inodes=fs_used_inodes,
+                    filesystem_error=filesystem_error,
+                    root_is_mountpoint=root_is_mountpoint,
                 ))
 
             scanner = RustTreeScanner(
@@ -1115,6 +1145,7 @@ class Clearspace(Gtk.Application):
                 self.scan_root,
                 root.size_bytes,
                 partial=report["partial"],
+                directories=int(report.get("directories", 0)),
             )
             self._update_recent_scan_line()
         except OSError as error:
@@ -1227,7 +1258,10 @@ class Clearspace(Gtk.Application):
             )
         else:
             self.scan_counter_label.set_text(f"{event.dirs_done:,} / estimating folders")
-        percent = progress_percent(event)
+        percent = progress_percent(
+            event,
+            root_is_mountpoint=event.root_is_mountpoint,
+        )
         if percent is None:
             self.scan_percent_label.set_text("")
             self.scan_progress_bar.pulse()
@@ -1251,6 +1285,15 @@ class Clearspace(Gtk.Application):
             self.scan_eta_value.set_text(f"~{format_elapsed(eta * 1000)}")
         path = event.current_path or str(self.scan_root)
         self.scan_path_label.set_text(f"Now scanning: {path}")
+        if event.filesystem_error:
+            self.scan_subtitle.set_text(
+                f"Filesystem capacity unavailable: {event.filesystem_error}"
+            )
+        elif event.fs_used_bytes is not None and event.fs_total_bytes is not None:
+            self.scan_subtitle.set_text(
+                f"Filesystem use: {format_bytes(event.fs_used_bytes)} of "
+                f"{format_bytes(event.fs_total_bytes)} · inode use: {event.fs_used_inodes}"
+            )
         self._scan_largest_items = tuple(getattr(event, "largest_items", ()))[:4]
         now = time.monotonic()
         if self._scan_largest_items and now - self._scan_last_top_render >= 1.0:

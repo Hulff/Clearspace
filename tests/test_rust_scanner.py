@@ -7,11 +7,65 @@ from pathlib import Path
 
 import pytest
 
+from clearspace import rust_scanner
 from clearspace.rust_scanner import RustTreeScanner
 from clearspace.scanner import TreeScanner
 
 
 BIN = Path(__file__).resolve().parents[1] / "scanner" / "target" / "release" / "clearspace-scan"
+
+
+def test_protocol_v2_progress_preserves_paths_top_k_and_previous_estimate() -> None:
+    assert hasattr(rust_scanner, "progress_event_from_rust"), "protocol v2 adapter is missing"
+    event = rust_scanner.progress_event_from_rust(
+        {
+            "protocol_version": 2,
+            "event": "progress",
+            "dirs_done": 4,
+            "dirs_queued": 3,
+            "dirs_total_est": 7,
+            "directories": 4,
+            "files": 9,
+            "allocated_bytes": 1024,
+            "errors": 1,
+            "current_path": "/scan/root/subdir",
+            "largest_items": [
+                {"name": "large.bin", "path": "/scan/root/large.bin", "bytes": 512}
+            ],
+        },
+        elapsed_ms=25,
+        prior_directories=11,
+    )
+
+    assert event.dirs_done == 4
+    assert event.dirs_total_est == 11
+    assert event.files == 9
+    assert event.bytes == 1024
+    assert event.current_path == "/scan/root/subdir"
+    assert event.largest_items == (("large.bin", "/scan/root/large.bin", 512),)
+    assert event.partial
+
+
+def test_protocol_v2_progress_rejects_an_oversized_top_list() -> None:
+    assert hasattr(rust_scanner, "progress_event_from_rust"), "protocol v2 adapter is missing"
+    payload = {
+        "protocol_version": 2,
+        "event": "progress",
+        "dirs_done": 1,
+        "dirs_queued": 0,
+        "dirs_total_est": 1,
+        "directories": 1,
+        "files": 0,
+        "allocated_bytes": 0,
+        "errors": 0,
+        "current_path": "/scan/root",
+        "largest_items": [
+            {"name": str(index), "path": f"/scan/root/{index}", "bytes": index}
+            for index in range(5)
+        ],
+    }
+    with pytest.raises(ValueError, match="largest_items"):
+        rust_scanner.progress_event_from_rust(payload, elapsed_ms=0)
 
 
 def _children(scanner, node):

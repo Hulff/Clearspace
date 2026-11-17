@@ -14,12 +14,12 @@ Build the standalone Rust scanner:
 cargo build --release --manifest-path scanner/Cargo.toml
 ```
 
-The GTK scan screen currently uses the Python scanner so its folder-level live
-progress, pause, cancellation, and partial results have consistent behavior.
-The Rust binary currently implements JSONL protocol v1 and is not selected by
-that screen; the app can switch back after the binary supports the scanner
-agnostic progress/control contract in protocol v2. `CLEARSPACE_SCAN_BIN` still
-selects a binary for the headless Rust adapter.
+The GTK scan screen uses the standalone Rust scanner through its versioned JSONL
+protocol. It reports the current path, an estimated directory total, filesystem
+capacity context, and the four largest observed files while scanning. A prior
+complete scan of the same canonical root can provide a better folder estimate;
+this metadata stays in the local history. `CLEARSPACE_SCAN_BIN` can select a
+specific scanner binary for headless integration tests.
 
 Na primeira abertura, Clearspace mostra o seletor de pasta com Home selecionada.
 Caches e Downloads aparecem como atalhos quando existem. A lista de pastas é
@@ -38,7 +38,7 @@ Clearspace stores a structured, local JSONL action history at `~/.local/share/cl
 - The standalone Rust scanner measures the tree in a background process, includes
   hidden files, counts allocated disk blocks and hardlinks once, and never follows
   symlinks. `RustTreeScanner` queries its SQLite database one directory at a time.
-- The GTK-free Python scanner powers the live scanning screen and supports its
+- The GTK-free Python scanner remains available for parity checks and supports
   cooperative controls and partial results.
 - The scanning screen reports folder progress with an estimated total, file/byte
   counters, elapsed time, a smoothed ETA, and a bounded list of the four largest

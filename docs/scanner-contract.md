@@ -1,6 +1,7 @@
 # Scanner SQLite and progress contract
 
-Version: `1`
+Database schema version: `1`
+Progress JSONL protocol version: `2`
 
 This contract separates filesystem traversal from the GTK process. The scanner
 is read-only. It receives a root and a SQLite database path as separate command
@@ -82,24 +83,35 @@ children total.
 
 The process writes UTF-8 JSON Lines to stdout: exactly one JSON object per line,
 terminated by `\n`. Stdout is reserved for this protocol; diagnostics go to
-stderr. Every object has `protocol_version: 1` and an `event` string. Progress
-objects contain counters only, not file names or contents.
+stderr. Every object has `protocol_version: 2` and an `event` string. Progress
+objects include local display paths and bounded item names, but never file
+contents. These values are untrusted display data and cannot authorize an action.
 
 Example stream:
 
 ```jsonl
-{"protocol_version":1,"event":"started"}
-{"protocol_version":1,"event":"progress","directories":128,"files":2048,"errors":1,"allocated_bytes":73400320}
-{"protocol_version":1,"event":"completed","root_id":1,"nodes":2177,"directories":129,"files":2048,"errors":1,"symlinks_skipped":3,"other_filesystems_skipped":0,"allocated_bytes":75497472,"duration_ms":932}
+{"protocol_version":2,"event":"started"}
+{"protocol_version":2,"event":"progress","directories":43,"dirs_done":43,"dirs_queued":9,"dirs_total_est":52,"files":2048,"errors":1,"allocated_bytes":73400320,"current_path":"/scan/root/example","largest_items":[{"name":"large.bin","path":"/scan/root/large.bin","bytes":7340032}]}
+{"protocol_version":2,"event":"completed","root_id":1,"nodes":2177,"directories":130,"dirs_done":130,"dirs_queued":0,"dirs_total_est":130,"files":2048,"errors":1,"symlinks_skipped":3,"other_filesystems_skipped":0,"allocated_bytes":75497472,"current_path":"/scan/root","largest_items":[{"name":"large.bin","path":"/scan/root/large.bin","bytes":7340032}],"duration_ms":932}
 ```
 
-`started` is emitted once after argument and database initialization. `progress`
-may be emitted zero or more times; its counters are cumulative and monotonic.
+`started` is emitted once after argument parsing and before filesystem traversal. `progress`
+is emitted at the bounded batch interval and once more before `completed`, so
+small trees also publish their final folder count. `directories`, `dirs_done`, `dirs_total_est`,
+`files`, `errors`, and `allocated_bytes` are cumulative and monotonic. `dirs_queued`
+is the number of discovered directories whose enumeration has not completed and may
+decrease. At each snapshot `dirs_total_est = dirs_done + dirs_queued`; it rises as
+new child directories are discovered. The live `largest_items` list is the four
+largest observed regular files, ordered by allocated bytes descending; it may
+change as larger files are found. Directory totals are aggregated after traversal,
+so they are not included in this live list.
+
 The final event is exactly one of:
 
 - `completed`: traversal finished. It includes `root_id`, node and skip/error
-  counts, allocated bytes, and `duration_ms`. A nonzero `errors` count means the
-  inventory is partial even though the process completed successfully.
+  counts, allocated bytes, `dirs_done`, `dirs_queued=0`, final `dirs_total_est`,
+  `current_path`, and `duration_ms`. A nonzero `errors` count means the inventory
+  is partial even though the process completed successfully.
 - `failed`: fatal setup or database error. It contains a stable `code` and a
   human-readable `message`; no success may be inferred from earlier progress.
 
@@ -109,21 +121,25 @@ Python caller must reject a missing terminal event, malformed JSON, an
 unsupported protocol version, or a mismatch between exit status and terminal
 event.
 
-### GTK-independent progress view (protocol version 2)
+### GTK-independent progress view
 
-The v1 inventory events above remain supported by the Rust binary. The Python
-application adapts those events (or Python scanner callbacks) to a
-scanner-independent `ProgressEvent`. A future scanner process that emits live
-folder progress uses JSONL protocol version 2, one object per line:
+The Python application adapts the Rust protocol v2 events (or Python scanner
+callbacks) to a scanner-independent GTK-free `ProgressEvent`. It obtains
+filesystem context locally with `os.statvfs`; `fs_used_bytes`, `fs_total_bytes`,
+and `fs_used_inodes` are not sent over the scanner protocol. For a scan root that
+is a mount point, the UI may compare scanned allocated bytes with `fs_used_bytes`.
+For subfolders, filesystem capacity is context only and folder progress uses the
+directory estimate, optionally informed by a previous complete scan of the same
+root stored in local JSONL history.
 
 ```jsonl
-{"protocol_version":2,"event":"progress","dirs_done":43,"dirs_total_est":428,"files":2048,"bytes":73400320,"elapsed_ms":1200,"current_path":"/scan/root/example","largest_items":[{"name":"example","path":"/scan/root/example","bytes":7340032}],"state":"running","partial":false}
-{"protocol_version":2,"event":"progress","dirs_done":43,"dirs_total_est":441,"files":2100,"bytes":75497472,"elapsed_ms":1300,"current_path":"/scan/root/another","largest_items":[{"name":"example","path":"/scan/root/example","bytes":7340032}],"state":"running","partial":false}
-{"protocol_version":2,"event":"completed","dirs_done":441,"dirs_total_est":441,"files":2177,"bytes":75497472,"elapsed_ms":1500,"largest_items":[],"state":"done","partial":false}
+{"protocol_version":2,"event":"progress","dirs_done":43,"dirs_queued":9,"dirs_total_est":52,"files":2048,"bytes":73400320,"elapsed_ms":1200,"current_path":"/scan/root/example","largest_items":[{"name":"example","path":"/scan/root/example","bytes":7340032}],"state":"running","partial":false}
+{"protocol_version":2,"event":"progress","dirs_done":47,"dirs_queued":14,"dirs_total_est":61,"files":2100,"bytes":75497472,"elapsed_ms":1300,"current_path":"/scan/root/another","largest_items":[{"name":"example","path":"/scan/root/example","bytes":7340032}],"state":"running","partial":false}
+{"protocol_version":2,"event":"completed","dirs_done":61,"dirs_queued":0,"dirs_total_est":61,"files":2177,"bytes":75497472,"elapsed_ms":1500,"largest_items":[{"name":"example","path":"/scan/root/example","bytes":7340032}],"state":"done","partial":false}
 ```
 
-`dirs_total_est` is nullable and may increase as directories are discovered.
-When it is null, clients show indeterminate progress. `dirs_done`, `files`,
+`dirs_total_est` is nonnegative and may increase as directories are discovered.
+`dirs_done`, `dirs_queued`, `files`,
 `bytes`, and `elapsed_ms` are nonnegative cumulative values; `bytes` means
 allocated bytes (`st_blocks * 512`). `current_path` is local display data only;
 it is untrusted and cannot authorize an action. `largest_items` is an optional
@@ -133,14 +149,11 @@ allocated bytes; consumers never use it to authorize an action. `state` is one o
 terminal `cancelled` event sets `partial` to true; the partial inventory remains
 available.
 
-The current v1 binary does not emit these live fields and does not support
-process pause/resume. Until upgraded, the Python integration adapts whatever
-progress is available and must not claim folder-level live progress from the
-Rust backend. For the future subprocess adapter, pause/resume applies
-`SIGSTOP`/`SIGCONT` only to the directly spawned scanner child process (never
-through a shell); the controller owns that process handle and does not signal
-arbitrary process IDs. A thread-based scanner instead cooperates through its
-pause event.
+The Rust binary emits protocol v2 live progress fields. Process pause/resume
+applies `SIGSTOP`/`SIGCONT` only to the directly spawned scanner child process
+(never through a shell); the controller owns that process handle and does not
+signal arbitrary process IDs. A thread-based scanner instead cooperates through
+its pause event.
 
 ## Process and safety requirements
 

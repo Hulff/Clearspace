@@ -14,10 +14,71 @@ from pathlib import Path
 from typing import Callable
 
 from .contracts import Node
+from .progress import ProgressEvent, ScanState
 
 
 class RustScannerError(RuntimeError):
     """The scanner process or its output violated the documented contract."""
+
+
+def progress_event_from_rust(
+    event: dict,
+    *,
+    elapsed_ms: int,
+    prior_directories: int | None = None,
+) -> ProgressEvent:
+    """Validate and adapt one Rust protocol-v2 live progress snapshot."""
+    if event.get("protocol_version") != 2 or event.get("event") != "progress":
+        raise ValueError("unsupported Rust progress event")
+    counters = (
+        "dirs_done",
+        "dirs_queued",
+        "dirs_total_est",
+        "files",
+        "allocated_bytes",
+        "errors",
+    )
+    values: dict[str, int] = {}
+    for key in counters:
+        value = event.get(key)
+        if type(value) is not int or value < 0:
+            raise ValueError(f"Rust progress event has invalid {key}")
+        values[key] = value
+    if values["dirs_done"] + values["dirs_queued"] != values["dirs_total_est"]:
+        raise ValueError("Rust progress directory estimate is inconsistent")
+    current_path = event.get("current_path")
+    if not isinstance(current_path, str):
+        raise ValueError("Rust progress event has invalid current_path")
+    items = event.get("largest_items")
+    if not isinstance(items, list) or len(items) > 4:
+        raise ValueError("Rust progress event has invalid largest_items")
+    largest_items = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError("Rust progress event has invalid largest_items entry")
+        name, path, size = item.get("name"), item.get("path"), item.get("bytes")
+        if (
+            not isinstance(name, str)
+            or not isinstance(path, str)
+            or type(size) is not int
+            or size < 0
+        ):
+            raise ValueError("Rust progress event has invalid largest_items entry")
+        largest_items.append((name, path, size))
+    total = values["dirs_total_est"]
+    if prior_directories is not None:
+        total = max(total, max(0, int(prior_directories)))
+    return ProgressEvent(
+        dirs_done=values["dirs_done"],
+        dirs_total_est=total,
+        files=values["files"],
+        bytes=values["allocated_bytes"],
+        elapsed_ms=max(0, int(elapsed_ms)),
+        current_path=current_path,
+        state=ScanState.RUNNING,
+        partial=values["errors"] > 0,
+        largest_items=tuple(largest_items),
+    )
 
 
 class RustTreeScanner:
@@ -119,7 +180,17 @@ class RustTreeScanner:
         events: list[dict] = []
         terminal: dict | None = None
         started = False
-        previous_progress = {key: 0 for key in ("directories", "files", "errors", "allocated_bytes")}
+        previous_progress = {
+            key: 0
+            for key in (
+                "directories",
+                "dirs_done",
+                "dirs_total_est",
+                "files",
+                "errors",
+                "allocated_bytes",
+            )
+        }
         try:
             assert process.stdout is not None
             for line in process.stdout:
@@ -139,7 +210,7 @@ class RustTreeScanner:
                     event = json.loads(line)
                 except json.JSONDecodeError as error:
                     raise RustScannerError("scanner emitted malformed JSONL") from error
-                if not isinstance(event, dict) or event.get("protocol_version") != 1:
+                if not isinstance(event, dict) or event.get("protocol_version") != 2:
                     raise RustScannerError("scanner emitted an unsupported protocol event")
                 if terminal is not None:
                     raise RustScannerError("scanner emitted data after its terminal event")
@@ -153,6 +224,10 @@ class RustTreeScanner:
                 elif not started:
                     raise RustScannerError("scanner emitted data before started")
                 if kind == "progress":
+                    try:
+                        progress_event_from_rust(event, elapsed_ms=0)
+                    except ValueError as error:
+                        raise RustScannerError(str(error)) from error
                     for key in previous_progress:
                         value = event.get(key)
                         if not isinstance(value, int) or value < previous_progress[key]:
@@ -187,6 +262,7 @@ class RustTreeScanner:
             for key in (
                 "nodes",
                 "directories",
+                "dirs_done",
                 "files",
                 "errors",
                 "symlinks_skipped",
@@ -230,11 +306,29 @@ class RustTreeScanner:
             "symlinks_skipped",
             "other_filesystems_skipped",
             "allocated_bytes",
+            "dirs_done",
+            "dirs_queued",
+            "dirs_total_est",
             "duration_ms",
         )
         for key in required:
-            if not isinstance(event.get(key), int) or event[key] < 0:
+            if type(event.get(key)) is not int or event[key] < 0:
                 raise RustScannerError(f"completed event has invalid {key}")
+        if event["dirs_queued"] != 0 or event["dirs_done"] != event["dirs_total_est"]:
+            raise RustScannerError("completed event has inconsistent directory estimate")
+        if not isinstance(event["current_path"], str):
+            raise RustScannerError("completed event has invalid current_path")
+        if not isinstance(event["largest_items"], list) or len(event["largest_items"]) > 4:
+            raise RustScannerError("completed event has invalid largest_items")
+        for item in event["largest_items"]:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("name"), str)
+                or not isinstance(item.get("path"), str)
+                or type(item.get("bytes")) is not int
+                or item["bytes"] < 0
+            ):
+                raise RustScannerError("completed event has invalid largest_items entry")
 
     def _connect(self) -> sqlite3.Connection:
         uri = self.database_path.as_uri() + "?mode=ro"

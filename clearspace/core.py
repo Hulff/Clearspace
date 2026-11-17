@@ -236,16 +236,20 @@ class History:
         *,
         partial: bool = False,
         timestamp: float | None = None,
+        directories: int | None = None,
     ) -> None:
         """Remember scan metadata locally without storing file contents."""
-        self.append({
+        record = {
             "schema_version": 1,
             "record_type": "scan",
             "timestamp": time.time() if timestamp is None else timestamp,
             "path": str(path),
             "size_bytes": max(0, int(size_bytes)),
             "partial": bool(partial),
-        })
+        }
+        if directories is not None:
+            record["directories"] = max(0, int(directories))
+        self.append(record)
 
     def latest_scan(self) -> dict | None:
         try:
@@ -265,6 +269,36 @@ class History:
                 and record["size_bytes"] >= 0
                 and isinstance(record.get("timestamp"), (int, float))
             ):
+                return record
+        return None
+
+    def latest_scan_for(self, path: Path) -> dict | None:
+        """Return the latest complete scan with a directory count for this root."""
+        try:
+            requested = Path(path).resolve()
+            lines = self.path.read_text(encoding="utf-8").splitlines()
+        except (FileNotFoundError, OSError):
+            return None
+        for line in reversed(lines):
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            if (
+                record.get("record_type") != "scan"
+                or record.get("partial") is True
+                or type(record.get("directories")) is not int
+                or record["directories"] < 0
+                or not isinstance(record.get("path"), str)
+            ):
+                continue
+            try:
+                recorded_path = Path(record["path"]).resolve()
+            except OSError:
+                continue
+            if recorded_path == requested:
                 return record
         return None
 
