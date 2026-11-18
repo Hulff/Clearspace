@@ -1,6 +1,18 @@
-# Guia para o Codex: modos de análise no Clearspace (v2, gerador de comandos)
+# Guia para o agy: modos de análise no Clearspace (v2, gerador de comandos)
 
 Leia o `AGENTS.md` primeiro. Ele tem prioridade sobre este guia. Se houver conflito, siga o AGENTS.md, avise e proponha a mudança; nunca edite invariantes por conta própria.
+
+## Como trabalhar neste projeto (regras do agente)
+
+Estas regras valem para você, o agente, durante todo o trabalho:
+
+- Trabalhe **uma fase por sessão**, em modo interativo (não use `agy -p`, porque as fases pedem que você pare e espere o OK do usuário).
+- **Peça confirmação antes de editar arquivos e de rodar comandos** que não sejam leitura ou testes. O usuário controla isso com `/permissions`.
+- **Nunca execute** os comandos de limpeza que o gerador produz, nem `gio trash`, `rm`, `sudo`, `pacman`, `docker ... prune`, `journalctl --vacuum`, `pip cache purge` ou equivalentes na máquina do usuário. Testes rodam só em `tmp_path` com dados sintéticos.
+- Não faça `git commit`, `git push` nem abra PR. Deixe as mudanças no working tree para o usuário revisar.
+- Não crie subagentes nem paralelize o trabalho. Faça as etapas em sequência.
+- Não invente comandos, flags ou resultados. Se não rodou, diga que não rodou.
+- Termine cada fase com: o que mudou, como verificar, e o que ficou sem verificação.
 
 ## Objetivo
 
@@ -24,7 +36,7 @@ Consequências:
 
 ## Conflito com o AGENTS.md (resolver na Fase 1)
 
-As invariantes 3 e 7 e o "Pronto quando" descrevem um app que executa a exclusão (`Gio.File.trash`) e registra resultado. Na v2 o app gera comandos. Na Fase 1, o Codex deve **propor um diff do AGENTS.md** (invariantes 3 e 7, seção Erros e UX) e **esperar o OK do usuário**. Até lá, não altere o AGENTS.md.
+As invariantes 3 e 7 e o "Pronto quando" descrevem um app que executa a exclusão (`Gio.File.trash`) e registra resultado. Na v2 o app gera comandos. Na Fase 1, **proponha um diff do AGENTS.md** (invariantes 3 e 7, seção Erros e UX) e **espere o OK do usuário**. Até lá, não altere o AGENTS.md.
 
 Pontos que o diff deve preservar: lixeira como padrão (`gio trash`), validação de caminhos protegidos, dados do usuário só em inspeção, risco crítico bloqueado, nenhuma ação automática.
 
@@ -83,38 +95,49 @@ Regras:
 10. Se `gio trash` falhar no terminal do usuário (lixeira indisponível), o script não faz fallback para `rm`. Exclusão permanente não é gerada nesta versão.
 11. Histórico JSONL registra só o evento `command_generated` (itens, bloqueios), **sem afirmar sucesso**.
 
-## Fases (uma skill por etapa)
+## Fases (um método por etapa)
 
-### Fase 1: contrato, esqueleto e diff do AGENTS.md — `$writing-plans`
-- Plano curto (arquivos, riscos, testes). Não altere código nem o AGENTS.md; espere o OK do usuário.
-- Rascunhe `docs/provider-contract.md` e `docs/command-generator.md`.
-- Proponha o diff do AGENTS.md descrito acima.
+Cada fase usa o método indicado. Não existem skills `$nome` aqui: siga as instruções do método como estão escritas.
+
+### Fase 1: contrato, esqueleto e diff do AGENTS.md
+**Método: planejar antes de agir.**
+- Devolva um plano curto (arquivos, riscos, testes) e **pare**. Não altere código nem o AGENTS.md; espere o OK do usuário.
+- Depois do OK, rascunhe `docs/provider-contract.md` e `docs/command-generator.md`.
+- Proponha o diff do AGENTS.md descrito acima, como texto, sem aplicar.
 - Barra lateral com os modos vazios; "Pastas" continua idêntico.
 
-### Fase 2: gerador de comandos — `$test-driven-development` + `$security-best-practices`
-Esta é a peça crítica. Escreva os testes primeiro (seção "Testes" abaixo).
+### Fase 2: gerador de comandos
+**Método: TDD + revisão de segurança.**
+- TDD: escreva primeiro os testes da seção "Testes obrigatórios" e rode-os para ver falhar. Só então implemente o mínimo para passar, depois refatore com os testes verdes.
+- Revisão de segurança: ao final, releia o gerador como um atacante que controla nomes de arquivo. Procure injeção por quoting, bypass da lista de protegidos (symlink, `..`, componentes), TOCTOU entre revalidação e geração, e caracteres de controle ou de formatação Unicode em rótulos e caminhos. Liste achados com arquivo:linha.
+- Esta é a peça crítica da v2.
 
-### Fase 3: Caches e Lixeira — `$test-driven-development`
+### Fase 3: Caches e Lixeira
+**Método: TDD.**
 - **Caches**: entradas declarativas para subpastas de `$XDG_CACHE_HOME` e caches de dev (npm, pnpm, Gradle, Cargo, Go, pip). Regenerável = risco baixo, aviso "será baixado de novo". Ação: `trash_path` ou `tool_command` (`pip cache purge`, `go clean -cache`, `pnpm store prune`, `npm cache clean --force`).
 - **Lixeira**: lista `$XDG_DATA_HOME/Trash/files` por tamanho e idade. **Somente inspeção.**
 - Cache nunca é protegido por diretório inteiro; protegido é por caminho exato canonicalizado.
 
-### Fase 4: Arquivos grandes e Logs — `$test-driven-development`
+### Fase 4: Arquivos grandes e Logs
+**Método: TDD.**
 - **Arquivos grandes**: consulta ao banco do scanner (`ORDER BY size DESC LIMIT 200`), filtro de tamanho mínimo, atalho para Downloads via XDG. Teste de contrato com as consultas EXATAS da UI contra o banco do scanner real.
 - **Logs**: `journalctl --disk-usage` (leitura), `$XDG_STATE_HOME`, logs grandes legíveis. `journalctl --vacuum-size` entra no bloco de admin.
 
-### Fase 5: Docker e Pacotes — `$test-driven-development`
+### Fase 5: Docker e Pacotes
+**Método: TDD.**
 - **Docker** (leitura): `docker system df`, imagens (em uso ou não), containers parados, cache de build. Comandos gerados: `docker image prune`, `docker container prune`, `docker builder prune`. **Volumes: inspect_only, sem comando de limpeza.**
 - Erros classificados: Docker ausente (`tool_missing`), sem permissão no socket (`socket_denied`), daemon parado. A UI mostra a mensagem e "Tentar de novo"; nunca fica em "Loading".
 - **Pacotes (Arch)**: detecção por `/etc/os-release`. Mostra tamanho de `/var/cache/pacman/pkg` e órfãos (`pacman -Qdtq`, leitura). Comandos (`paccache`, `pacman -Rns`) só no bloco de admin.
-- Testes com saída de exemplo **sintética** e `subprocess` mockado.
+- Testes com saída de exemplo **sintética** e `subprocess` mockado. Você não deve rodar `docker` nem `pacman` de verdade além dos comandos de leitura listados.
 
-### Fase 6: fechamento — `$verification-before-completion`
+### Fase 6: fechamento
+**Método: verificar antes de declarar pronto.**
 - "Reescanear" depois de colar os comandos, mostrando o ganho real via `os.statvfs` antes e depois.
+- Rode testes e lint, leia a saída completa e só então afirme o resultado.
 
 ## Correção pendente: falso positivo "Aplicação em uso"
 
-O diálogo "Hyprland está usando /home/…" é um falso positivo. Use `$systematic-debugging` antes de editar: ache a causa raiz com arquivo:linha na checagem de `/proc`. Hipótese a confirmar: a comparação está invertida. Só deve contar como em uso se o `cwd` ou um fd do processo estiver **dentro do item** (`cwd.is_relative_to(item)`); ancestrais como o home ou `/` não contam. Todo texto de botão deve ser honesto: o app não fecha processos, então use "Já fechei, tentar novamente". Adicione teste de regressão em `tmp_path` com processo cujo `cwd` é ancestral do item.
+**Método: depuração sistemática.** O diálogo "Hyprland está usando /home/…" é um falso positivo. Antes de editar, reproduza e ache a causa raiz com arquivo:linha na checagem de `/proc`. Hipótese a confirmar: a comparação está invertida. Só deve contar como em uso se o `cwd` ou um fd do processo estiver **dentro do item** (`cwd.is_relative_to(item)`); ancestrais como o home ou `/` não contam. Todo texto de botão deve ser honesto: o app não fecha processos, então use "Já fechei, tentar novamente". Adicione teste de regressão em `tmp_path` com processo cujo `cwd` é ancestral do item.
 
 ## Desempenho (6 GB de RAM)
 
@@ -145,15 +168,16 @@ Se um comando não existir, diga; não invente.
 
 - Não execute comandos de limpeza no app, não use sudo, pkexec, su nem shell.
 - Não gere `rm`, `rm -rf` nem exclusão permanente.
+- Não rode você mesmo nenhum comando de limpeza na máquina do usuário.
 - Não adicione dependência, LLM, RAG ou telemetria.
 - Não marque nem apague nada automaticamente.
 - Não edite o AGENTS.md sem o OK do usuário.
-- Não use `$subagent-driven-development`, `$dispatching-parallel-agents` nem `$yeet`.
+- Não crie subagentes, não paralelize e não faça commit, push nem PR.
 
 ## Pronto quando
 
 Invariantes (conforme o AGENTS.md aprovado) preservadas; testes e lint passam (ou a ausência foi declarada); nenhum erro engolido; README e `docs/` atualizados; resumo com evidência e **lista do que não foi verificado** (diálogos GTK, Docker real, sistema não-Arch, execução real dos comandos gerados no terminal).
 
-## Primeira mensagem sugerida ao Codex
+## Primeira mensagem sugerida ao agy
 
-> Leia AGENTS.md e docs/clearspace_update_guide.md . Comece pela Fase 1 com `$writing-plans`: devolva o plano curto, o rascunho de `docs/provider-contract.md` e `docs/command-generator.md`, e o diff proposto para o AGENTS.md, sem alterar código. Espere meu OK antes da Fase 2.
+> Leia AGENTS.md e docs/clearspace_update_guide.md. Comece pela Fase 1: devolva o plano curto e pare. Depois do meu OK, escreva o rascunho de `docs/provider-contract.md` e `docs/command-generator.md` e o diff proposto para o AGENTS.md, sem alterar código nem aplicar o diff. Espere meu OK antes da Fase 2.
