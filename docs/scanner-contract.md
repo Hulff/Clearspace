@@ -15,6 +15,7 @@ are stable for the lifetime of one scan only.
 
 ```sql
 PRAGMA foreign_keys = ON;
+PRAGMA user_version = 1;
 
 CREATE TABLE nodes (
     id          INTEGER PRIMARY KEY,
@@ -171,4 +172,4 @@ The Rust implementation lives in the independent `scanner/` crate. It uses
 for local database writes, avoiding a dependency on a system SQLite CLI or
 shared library. Build it with `cargo build --release --manifest-path
 scanner/Cargo.toml`; invoke it as
-`clearspace-scan <root> --db <database> [--exclude <path> ...]`.
+`clearspace-scan <root> --db <database> [--exclude <path> ...]` (or `clearspace-scan --version` to print binary, SQLite schema, and protocol versions). The `completed` event includes `"schema_version": 1`, matching `PRAGMA user_version` in the SQLite file.

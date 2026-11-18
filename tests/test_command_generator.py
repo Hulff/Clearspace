@@ -86,11 +86,12 @@ def test_hostile_filenames_roundtrip_exact_argv_without_expansion(
         parsed = shlex.split(generated_item.command_line)
         assert parsed == ["gio", "trash", "--", expected_path]
 
-    command_lines = [
-        line
-        for line in result.script.splitlines()
-        if line.strip() and not line.lstrip().startswith("#")
-    ]
+    assert not any(line.lstrip().startswith("#") for line in result.script.splitlines())
+    assert not any(line.lstrip().startswith("#") for line in result.user_script.splitlines())
+    assert result.admin_script == ""
+    assert result.user_script == result.script
+
+    command_lines = [line for line in result.script.splitlines() if line.strip()]
     assert command_lines[0] == "df -h --output=avail /"
     assert command_lines[-1] == "df -h --output=avail /"
     for cmd_line, expected_path in zip(command_lines[1:-1], expected_paths, strict=True):
@@ -268,24 +269,26 @@ def test_script_structure_admin_isolation_and_no_forbidden_constructs(
 
     assert result.blocked == ()
     assert len(result.generated) == 4
-    assert "revise" in result.script.casefold()
+    assert result.user_script
+    assert result.admin_script
 
-    admin_marker = "# === Requer administrador"
-    assert admin_marker in result.script
-    before_admin, admin_section = result.script.split(admin_marker, maxsplit=1)
+    for block in (result.script, result.user_script, result.admin_script):
+        assert not any(line.lstrip().startswith("#") for line in block.splitlines())
 
-    assert "sudo" not in before_admin
-    assert "df -h --output=avail /" in before_admin
-    assert "# Cache do Gradle" in before_admin
-    assert "# Cache de build do Go" in before_admin
-    assert "# Journal do sistema" in admin_section
-    assert "# Cache de pacotes do pacman" in admin_section
-    assert admin_section.strip().endswith("df -h --output=avail /")
+    assert "sudo" not in result.user_script
+    assert "df -h --output=avail /" in result.user_script
+    assert result.user_script.strip().startswith("df -h --output=avail /")
+    assert result.user_script.strip().endswith("df -h --output=avail /")
+    assert result.admin_script.strip().startswith("df -h --output=avail /")
+    assert result.admin_script.strip().endswith("df -h --output=avail /")
 
-    for section, allow_sudo in ((before_admin, False), (admin_section, True)):
+    for section, allow_sudo in (
+        (result.user_script, False),
+        (result.admin_script, True),
+    ):
         for line in section.splitlines():
             stripped = line.strip()
-            if not stripped or stripped.startswith("#"):
+            if not stripped:
                 continue
             assert "&&" not in stripped
             assert "||" not in stripped
@@ -638,3 +641,150 @@ def test_provider_result_enforces_immutable_tuples_and_gtk_free_imports() -> Non
     assert isinstance(res.rows, tuple)
     assert res.smaller_count == 2
     assert res.smaller_bytes == 512
+
+
+def test_security_review_regressions_ancestor_of_protected_and_user_data_guards(
+    tmp_path: Path,
+) -> None:
+    fake_home = tmp_path / "home"
+    # ~/.docker contains protected ~/.docker/config.json; trashing ~/.docker
+    # as a whole must be blocked because it encloses a protected path.
+    docker_cfg_dir = fake_home / ".docker"
+    docker_cfg_dir.mkdir(parents=True)
+    (docker_cfg_dir / "config.json").write_text("{}", encoding="utf-8")
+
+    # User-data directories inside otherwise allowed roots must be rejected
+    # even if a buggy caller passes action="trash_path".
+    hf_models = fake_home / ".cache" / "huggingface" / "hub"
+    hf_models.mkdir(parents=True)
+
+    firefox_profile = fake_home / ".mozilla" / "firefox" / "default"
+    firefox_profile.mkdir(parents=True)
+
+    rootless_volumes = fake_home / ".local" / "share" / "docker" / "volumes" / "db"
+    rootless_volumes.mkdir(parents=True)
+
+    work_root = fake_home / "projects"
+    git_repo = work_root / "repo"
+    (git_repo / ".git").mkdir(parents=True)
+    repo_subfile = git_repo / "build.bin"
+    repo_subfile.write_bytes(b"123")
+
+    node_mods = work_root / "webapp" / "node_modules" / "pkg"
+    node_mods.mkdir(parents=True)
+
+    rows = [
+        Row(
+            id="ancestor.docker_dir",
+            label="Diretório .docker inteiro",
+            size_bytes=4096,
+            risk="medium",
+            action="trash_path",
+            path=docker_cfg_dir,
+            allowed_root=fake_home,
+        ),
+        Row(
+            id="ancestor.local_share",
+            label="Diretório .local inteiro",
+            size_bytes=4096,
+            risk="medium",
+            action="trash_path",
+            path=fake_home / ".local",
+            allowed_root=fake_home,
+        ),
+        Row(
+            id="userdata.hf",
+            label="Modelos Hugging Face",
+            size_bytes=4096,
+            risk="high",
+            action="trash_path",
+            path=hf_models,
+            allowed_root=fake_home / ".cache",
+        ),
+        Row(
+            id="userdata.firefox",
+            label="Perfil Firefox",
+            size_bytes=4096,
+            risk="high",
+            action="trash_path",
+            path=firefox_profile,
+            allowed_root=fake_home,
+        ),
+        Row(
+            id="userdata.docker_vol",
+            label="Volume rootless",
+            size_bytes=4096,
+            risk="high",
+            action="trash_path",
+            path=rootless_volumes,
+            allowed_root=fake_home,
+        ),
+        Row(
+            id="userdata.git_repo",
+            label="Arquivo dentro de repositório Git",
+            size_bytes=512,
+            risk="high",
+            action="trash_path",
+            path=repo_subfile,
+            allowed_root=work_root,
+        ),
+        Row(
+            id="userdata.node_modules",
+            label="Pacote em node_modules",
+            size_bytes=512,
+            risk="medium",
+            action="trash_path",
+            path=node_mods,
+            allowed_root=work_root,
+        ),
+        Row(
+            id="tool.docker_volume_prune",
+            label="Docker volume prune proibido",
+            size_bytes=1024,
+            risk="high",
+            action="tool_command",
+            argv=["docker", "volume", "prune"],
+        ),
+        Row(
+            id="tool.docker_system_volumes",
+            label="Docker system prune --volumes proibido",
+            size_bytes=1024,
+            risk="high",
+            action="tool_command",
+            argv=["docker", "system", "prune", "--volumes"],
+        ),
+        Row(
+            id="tool.wrapper_env",
+            label="Wrapper env proibido",
+            size_bytes=1024,
+            risk="low",
+            action="tool_command",
+            argv=["env", "rm", "-rf", "/"],
+        ),
+        Row(
+            id="bad\x1bid",
+            label="ID com ESC",
+            size_bytes=512,
+            risk="low",
+            action="inspect_only",
+        ),
+    ]
+
+    result = generate_commands(rows, protected_paths=_base_protected(fake_home))
+
+    assert result.generated == ()
+    assert result.script == ""
+    blocked_by_id = {item.row_id: item.reason.kind for item in result.blocked}
+    assert blocked_by_id["ancestor.docker_dir"] == "protected"
+    assert blocked_by_id["ancestor.local_share"] == "protected"
+    assert blocked_by_id["userdata.hf"] in {"protected", "inspect_only"}
+    assert blocked_by_id["userdata.firefox"] in {"protected", "inspect_only"}
+    assert blocked_by_id["userdata.docker_vol"] in {"protected", "inspect_only"}
+    assert blocked_by_id["userdata.git_repo"] == "inspect_only"
+    assert blocked_by_id["userdata.node_modules"] == "inspect_only"
+    assert blocked_by_id["tool.docker_volume_prune"] == "invalid_row"
+    assert blocked_by_id["tool.docker_system_volumes"] == "invalid_row"
+    assert blocked_by_id["tool.wrapper_env"] == "invalid_row"
+    assert "badid" in blocked_by_id
+    assert "\x1b" not in "".join(item.row_id for item in result.blocked)
+

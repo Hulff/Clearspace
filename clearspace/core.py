@@ -124,9 +124,6 @@ def inspection_only_paths(home: Path | None = None) -> tuple[Path, ...]:
         ".cache/huggingface",
         ".local/share/PrismLauncher",
         ".config/Postman",
-        ".gradle",
-        ".codex",
-        ".cache/yay",
     ))
 
 
@@ -163,12 +160,6 @@ def discover_candidates() -> list[Candidate]:
              "May contain Minecraft worlds, instances, and modpacks.", "Personal data · inspect only")
     add_path("postman", "Postman data", inspection_paths[3],
              "May contain local settings, workspaces, and application data.", "Personal data · inspect only")
-    add_path("gradle", "Gradle data", inspection_paths[4],
-             "May contain build caches, wrapper distributions, and project state.", "Personal data · inspect only")
-    add_path("codex", "Codex data", inspection_paths[5],
-             "May contain local configuration and user data.", "Personal data · inspect only")
-    add_path("yay", "yay package cache", inspection_paths[6],
-             "May contain package build files and cached sources.", "Personal data · inspect only")
 
     if shutil.which("go"):
         candidates.append(Candidate("go-clean", "Go build cache (Go tool)", None,
@@ -250,6 +241,40 @@ class History:
         if directories is not None:
             record["directories"] = max(0, int(directories))
         self.append(record)
+
+    def record_command_generated(
+        self,
+        result: object,
+        *,
+        timestamp: float | None = None,
+    ) -> dict:
+        """Record generated and blocked row IDs without claiming execution success."""
+        generated_entries = [
+            {
+                "row_id": str(item.row_id),
+                "action": str(item.action),
+                "size_bytes": item.size_bytes,
+                "needs_admin": bool(item.needs_admin),
+            }
+            for item in getattr(result, "generated", ())
+        ]
+        blocked_entries = [
+            {
+                "row_id": str(item.row_id),
+                "reason_kind": str(item.reason.kind),
+            }
+            for item in getattr(result, "blocked", ())
+        ]
+        record = {
+            "schema_version": 2,
+            "record_type": "command_generated",
+            "event": "command_generated",
+            "timestamp": time.time() if timestamp is None else timestamp,
+            "generated": generated_entries,
+            "blocked": blocked_entries,
+        }
+        self.append(record)
+        return record
 
     def latest_scan(self) -> dict | None:
         try:

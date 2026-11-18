@@ -12,6 +12,8 @@ use std::sync::{
 };
 use std::time::Instant;
 
+const SCHEMA_VERSION: i32 = 1;
+
 #[derive(Default)]
 struct Counts {
     nodes: u64,
@@ -312,10 +314,12 @@ fn process(
     }
     let _temp_guard = TempDatabase(temp.clone());
     let conn = Connection::open(&temp).map_err(|e| format!("database: {e}"))?;
-    conn.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA foreign_keys=ON;
+    conn.execute_batch(&format!(
+        "PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF; PRAGMA foreign_keys=ON; PRAGMA user_version={SCHEMA_VERSION};
         CREATE TABLE nodes(id INTEGER PRIMARY KEY,parent_id INTEGER REFERENCES nodes(id),name TEXT NOT NULL,is_dir INTEGER NOT NULL CHECK(is_dir IN (0,1)),size_blocks INTEGER NOT NULL CHECK(size_blocks>=0),mtime INTEGER,error TEXT,partial INTEGER NOT NULL DEFAULT 0 CHECK(partial IN (0,1)),child_count INTEGER NOT NULL DEFAULT 0,child_size_blocks INTEGER NOT NULL DEFAULT 0);
-        CREATE TABLE scan_paths(path TEXT PRIMARY KEY,id INTEGER NOT NULL,depth INTEGER NOT NULL);")
-        .map_err(|e|format!("schema: {e}"))?;
+        CREATE TABLE scan_paths(path TEXT PRIMARY KEY,id INTEGER NOT NULL,depth INTEGER NOT NULL);"
+    ))
+    .map_err(|e| format!("schema: {e}"))?;
     conn.execute_batch("BEGIN IMMEDIATE")
         .map_err(|e| e.to_string())?;
     let root_name = root
@@ -586,6 +590,16 @@ fn entry_depth_hint(path: &Path, root: &Path) -> usize {
 }
 
 fn main() {
+    if env::args_os()
+        .nth(1)
+        .is_some_and(|arg| arg == "--version" || arg == "-V")
+    {
+        println!(
+            "clearspace-scan {} schema={SCHEMA_VERSION} protocol=2",
+            env!("CARGO_PKG_VERSION")
+        );
+        return;
+    }
     let started = Instant::now();
     let (root, db, excludes, include_hidden, stay_on_device) = match parse_args() {
         Ok(v) => v,
@@ -617,7 +631,7 @@ fn main() {
                 .first_progress_ms
                 .map_or_else(|| "null".to_owned(), |value| value.to_string());
             let fields = format!(
-                ",\"root_id\":{root_id},\"nodes\":{},\"directories\":{},\"dirs\":{},\"dirs_done\":{},\"dirs_queued\":0,\"dirs_total_est\":{},\"files\":{},\"errors\":{},\"unreadable_count\":{},\"symlinks_skipped\":{},\"other_filesystems_skipped\":{},\"allocated_bytes\":{},\"bytes\":{},\"current_path\":\"{}\",\"largest_items\":{},\"first_progress_ms\":{},\"duration_ms\":{}",
+                ",\"schema_version\":{SCHEMA_VERSION},\"root_id\":{root_id},\"nodes\":{},\"directories\":{},\"dirs\":{},\"dirs_done\":{},\"dirs_queued\":0,\"dirs_total_est\":{},\"files\":{},\"errors\":{},\"unreadable_count\":{},\"symlinks_skipped\":{},\"other_filesystems_skipped\":{},\"allocated_bytes\":{},\"bytes\":{},\"current_path\":\"{}\",\"largest_items\":{},\"first_progress_ms\":{},\"duration_ms\":{}",
                 c.nodes,
                 c.directories,
                 c.directories,
@@ -771,6 +785,10 @@ mod tests {
 
         let (counts, root_id) = process(&root, &db, &[], true, true).expect("scan fixture");
         let conn = Connection::open(&db).expect("open output database");
+        let user_version: i32 = conn
+            .query_row("PRAGMA user_version", [], |r| r.get(0))
+            .expect("query user_version");
+        assert_eq!(user_version, SCHEMA_VERSION);
         let root_size: i64 = conn
             .query_row(
                 "SELECT size_blocks FROM nodes WHERE id=?1",

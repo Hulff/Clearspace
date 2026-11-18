@@ -1,6 +1,6 @@
 # Clearspace
 
-Clearspace is a local-first Linux disk cleanup app. It measures common disk consumers, explains what can be reclaimed, and runs native cleanup tools only after the user reviews and confirms an action.
+Clearspace is a local-first Linux disk cleanup advisor. It measures common disk consumers across dedicated modes (Caches, Trash, Large Files, Logs, Docker, Arch Packages, and Folders), explains what can be reclaimed, and generates safe, comment-free terminal commands for the user to review and paste (Clearspace never executes cleanup commands).
 
 ## Run
 
@@ -59,16 +59,7 @@ Clearspace stores a structured, local JSONL action history at `~/.local/share/cl
 - The tree supports keyboard navigation (Space toggles cleanup selection, Left/Right
   collapses/expands rows). The assistant/details panel collapses automatically below
   1000 px and can be reopened with the toolbar toggle.
-- File actions use a reviewed, one-item executor: Gio trash is the default, permanent
-  removal requires typing a confirmation phrase, and critical-risk paths are blocked.
-  Paths are revalidated against protected roots, active data, filesystem boundaries, and
-  symlinks before acting. The review warns about likely ownership or parent-permission
-  failures. Each attempt records its result and error category in JSONL; failures do not
-  stop later confirmed items, and the final summary offers a copy-path button per failure.
-  Gio reports unsupported trash filesystems separately from permission failures. Protected
-  system, home-root, credential, and editor-user paths use canonical component checks;
-  known regenerable caches remain selectable. If a process is using an item, the review
-  names it and offers a retry after it is closed.
-- Cleanup runs one native command at a time, with a confirmation dialog showing the command and expected impact.
-- Data-bearing targets such as Trash, Docker volumes, browser profiles, model downloads, and project directories are inspection-only.
+- Command generation (never executed by the app): selected safe paths emit independent `gio trash -- <quoted-path>` lines, and native tool cleanups emit fixed registry commands (`shlex.join`). Permanent deletion (`rm`) is never generated. Administrator commands (`sudo ...`) are isolated into their own review block and copy button. Generated command blocks omit `#` comments so pasting into interactive `zsh` or `bash` works without error.
+- Revalidation happens at script-generation time against protected roots, symlinks, filesystem boundaries, control/NUL characters, and `inspect_only` / `critical` rules. Each generation records a `command_generated` event in JSONL history (`~/.local/share/clearspace/history.jsonl`).
+- Data-bearing targets such as Trash, Docker volumes, browser profiles, model downloads, orphan package lists, and project directories are inspection-only.
 - The app does not invoke a shell or request administrator privileges.

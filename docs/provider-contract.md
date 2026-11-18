@@ -149,6 +149,13 @@ class ProviderContext:
     os_release_path: Path
     run_readonly_command: ReadOnlyRunner
     protected_paths: tuple[ProtectedPath, ...]
+    home_dir: Path | None = None
+    environ: Mapping[str, str] = ...
+    which: Callable[[str], str | None] = shutil.which
+    large_files_min_bytes: int = 0
+    large_files_downloads_only: bool = False
+    system_log_dir: Path = Path("/var/log")
+    pacman_cache_dir: Path = Path("/var/cache/pacman/pkg")
 
 
 class Provider(Protocol):

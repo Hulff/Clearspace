@@ -60,6 +60,8 @@ class CommandGenerationResult:
     generated: tuple[GeneratedItem, ...]
     blocked: tuple[BlockedItem, ...]
     warnings: tuple[str, ...] = ()
+    user_script: str = ""         # non-admin commands only
+    admin_script: str = ""        # admin commands only (isolated block)
 
 
 def generate_commands(
@@ -133,25 +135,26 @@ gio trash -- <shlex.quote(str(canonical))>
   `shlex.join(("sudo", *row.argv))` **only** inside the dedicated administrator
   section. `sudo` never appears outside the administrator section.
 
-### 5. Independent command layout
-When `generated` is non-empty, `script` uses independent lines (no `&&`, `||`,
-`;`, pipelines `|`, `$(...)`, backticks, or `set -e`) so a single command failure
-does not abort subsequent commands:
+### 5. Independent command layout (comment-free for zsh/bash paste)
+When `generated` is non-empty, `user_script`, `admin_script`, and `script` use
+independent executable lines (no `#` comments—since interactive `zsh` leaves
+`INTERACTIVE_COMMENTS` off by default—and no `&&`, `||`, `;`, pipelines `|`,
+`$(...)`, backticks, or `set -e`) so a single command failure does not abort
+subsequent commands. Labels, sizes, warnings, and the `"revise antes de colar"`
+banner are displayed in the review UI:
 
+Standard block (`user_script`):
 ```sh
-# Clearspace — revise cada comando antes de colar no terminal.
 df -h --output=avail /
-
-# <label> (~<formatted_size>)
 gio trash -- '/caminho/seguro/exemplo'
-
-# <label_ferramenta> (~<formatted_size>)
 go clean -cache
+df -h --output=avail /
+```
 
-# === Requer administrador (revise com atenção) ===
-# <label_admin> (~<formatted_size>)
+Administrator block (`admin_script`, isolated in its own UI section):
+```sh
+df -h --output=avail /
 sudo journalctl --vacuum-size=200M
-
 df -h --output=avail /
 ```
 

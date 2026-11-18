@@ -16,6 +16,8 @@ from typing import Callable
 from .contracts import Node, parse_scan_error_kind
 from .progress import ProgressEvent, ScanState
 
+SCANNER_SCHEMA_VERSION = 1
+
 
 class RustScannerError(RuntimeError):
     """The scanner process or its output violated the documented contract."""
@@ -332,6 +334,12 @@ class RustTreeScanner:
             value = event.get(key, event.get("errors", 0) if key == "unreadable_count" else None)
             if type(value) is not int or value < 0:
                 raise RustScannerError(f"completed event has invalid {key}")
+        if event.get("schema_version", SCANNER_SCHEMA_VERSION) != SCANNER_SCHEMA_VERSION:
+            raise RustScannerError(
+                f"Versão do esquema do scanner incompatível: "
+                f"esperado {SCANNER_SCHEMA_VERSION}, recebido {event.get('schema_version')}. "
+                "Recompile o binário clearspace-scan."
+            )
         if event["dirs_queued"] != 0 or event["dirs_done"] != event["dirs_total_est"]:
             raise RustScannerError("completed event has inconsistent directory estimate")
         if not isinstance(event["current_path"], str):
@@ -350,7 +358,23 @@ class RustTreeScanner:
 
     def _connect(self) -> sqlite3.Connection:
         uri = self.database_path.as_uri() + "?mode=ro"
-        return sqlite3.connect(uri, uri=True)
+        connection = sqlite3.connect(uri, uri=True)
+        try:
+            row = connection.execute("PRAGMA user_version").fetchone()
+            version = row[0] if row is not None else None
+            if version != SCANNER_SCHEMA_VERSION:
+                connection.close()
+                raise RustScannerError(
+                    f"Versão incompatível do banco de varredura "
+                    f"(encontrada: {version}, esperada: {SCANNER_SCHEMA_VERSION}). "
+                    "Execute uma nova varredura ou recompile o scanner."
+                )
+        except sqlite3.Error as error:
+            connection.close()
+            raise RustScannerError(
+                f"Não foi possível verificar a versão do banco de varredura: {error}"
+            ) from error
+        return connection
 
     def _expand_legacy(self, node: Node) -> list[Node]:
         if not node.is_dir or node.children_loaded:

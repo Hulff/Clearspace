@@ -25,6 +25,11 @@ from clearspace.assistant import (
     LocalRuleAssistant,
     ScanConsumer,
 )
+from clearspace.command_generator import (
+    CommandGenerationResult,
+    default_protected_paths,
+    generate_commands,
+)
 from clearspace.contracts import (
     Node,
     ProposedActionKind,
@@ -33,6 +38,23 @@ from clearspace.contracts import (
     SelectionState,
 )
 from clearspace.core import History, format_bytes, inspection_only_paths
+from clearspace.provider_contract import (
+    ClassifiedError,
+    ProviderContext,
+    ProviderResult,
+    Row,
+    run_readonly_subprocess,
+)
+from clearspace.providers import (
+    RISK_LABELS_PT_BR,
+    build_folder_selection_rows,
+    collect_review_advisories,
+    evaluate_tree_node_eligibility,
+    format_age_pt_br,
+    format_smaller_summary_pt_br,
+    get_provider,
+    is_row_selectable,
+)
 from clearspace.progress import (
     EtaEstimator,
     ProgressEvent,
@@ -45,16 +67,6 @@ from clearspace.progress import (
     filesystem_stats,
     progress_percent,
     relative_size_fraction,
-)
-from clearspace.executor import (
-    ActiveApplicationError,
-    CleanupReview,
-    FileAction,
-    ItemExecutor,
-    ReviewedItem,
-    build_review,
-    discover_active_paths,
-    gio_trash_supported,
 )
 from clearspace.locations import (
     ScanOptions,
@@ -108,6 +120,15 @@ class TreeEntry(GObject.Object):
         self.bound_rows = set()
         self.load_generation = 0
         self.is_expanded = False
+        self.block_reason: str | None = None
+
+
+class ProviderRowEntry(GObject.Object):
+    """Lightweight GTK list item wrapper around a GTK-free provider Row."""
+
+    def __init__(self, row: Row):
+        super().__init__()
+        self.row = row
 
 
 class Clearspace(Gtk.Application):
@@ -115,7 +136,8 @@ class Clearspace(Gtk.Application):
         super().__init__(application_id="org.clearspace.DiskCleanup")
         self.history = History()
         self.rule_engine = RuleEngine()
-        self.scan_root = Path(GLib.get_home_dir())
+        self._home_dir = Path(GLib.get_home_dir())
+        self.scan_root = self._home_dir
         self.scan_options = ScanOptions()
         self.chosen_scan_path = self.scan_root
         self.browser_path = self.scan_root
@@ -125,11 +147,11 @@ class Clearspace(Gtk.Application):
         self.selection: SelectionModel | None = None
         self.entries: dict[Path, TreeEntry] = {}
         self.inspection_only_roots: tuple[Path, ...] = ()
+        self.protected_paths = default_protected_paths(self._home_dir)
         self.check_buttons: dict[Path, list[Gtk.CheckButton]] = {}
         self._syncing_checks = 0
-        self._review: CleanupReview | None = None
-        self._review_action: FileAction | None = None
-        self._execution_results = []
+        self._folders_last_free_bytes: int | None = None
+        self._folders_compare_prev_free: int | None = None
         self._workflow_busy = False
         self._scan_generation = 0
         self._scan_started_at = 0.0
@@ -152,13 +174,47 @@ class Clearspace(Gtk.Application):
         self._live_entry_count = 0
         self._reserved_node_count = 0
         self._selected_evaluations: dict[Path, RuleEvaluation] = {}
+        self._mode_states: dict[str, dict] = {}
 
     def do_activate(self):
         self.window = Gtk.ApplicationWindow(application=self, title="Clearspace")
         self.window.set_default_size(1280, 820)
         self._install_theme()
-        self.stack = Gtk.Stack(transition_type=Gtk.StackTransitionType.CROSSFADE)
-        self.window.set_child(self.stack)
+        self.mode_stack = Gtk.Stack(
+            transition_type=Gtk.StackTransitionType.CROSSFADE,
+            hexpand=True,
+            vexpand=True,
+        )
+        self.mode_sidebar = Gtk.StackSidebar()
+        self.mode_sidebar.set_stack(self.mode_stack)
+        self.mode_sidebar.set_size_request(190, -1)
+
+        shell = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL)
+        shell.append(self.mode_sidebar)
+        shell.append(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL))
+        shell.append(self.mode_stack)
+        self.window.set_child(shell)
+
+        self.stack = Gtk.Stack(
+            transition_type=Gtk.StackTransitionType.CROSSFADE,
+            hexpand=True,
+            vexpand=True,
+        )
+        self.mode_stack.add_titled(self.stack, "folders", "Pastas")
+        for mode_id, mode_title in (
+            ("docker", "Docker"),
+            ("caches", "Caches"),
+            ("logs", "Logs"),
+            ("large_files", "Arquivos grandes"),
+            ("trash", "Lixeira"),
+            ("packages", "Pacotes"),
+        ):
+            self.mode_stack.add_titled(
+                self._build_mode_page(mode_id, mode_title), mode_id, mode_title
+            )
+        self.mode_stack.set_visible_child_name("folders")
+        self.mode_stack.connect("notify::visible-child-name", self._on_mode_changed)
+
         self._build_scanning_screen()
         self._build_folder_chooser()
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
@@ -227,17 +283,18 @@ class Clearspace(Gtk.Application):
         footer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         footer.add_css_class("results-footer")
         footer_row = Gtk.Box(spacing=12)
-        self.selection_label = Gtk.Label(label="0 items selected", xalign=0, hexpand=True)
+        self.selection_label = Gtk.Label(label="0 itens selecionados", xalign=0, hexpand=True)
         footer_row.append(self.selection_label)
-        self.review_button = Gtk.Button(label="Review and clean…")
+        self.review_button = Gtk.Button(label="Gerar comandos…")
         self.review_button.add_css_class("suggested-action")
         self.review_button.set_sensitive(False)
         self.review_button.connect("clicked", self.review_selection)
         footer_row.append(self.review_button)
         footer.append(footer_row)
         trash_note = Gtk.Label(
-            label="Items go to the Trash first. Space is freed when you empty it.",
+            label="O Clearspace nunca executa limpeza: gera comandos gio trash para revisar e copiar no terminal.",
             xalign=0,
+            wrap=True,
         )
         trash_note.add_css_class("selection-note")
         footer.append(trash_note)
@@ -249,6 +306,757 @@ class Clearspace(Gtk.Application):
         self._responsive_poll_source = GLib.timeout_add(
             500, self._check_responsive_panel
         )
+
+    def _build_mode_page(self, mode_id: str, title: str) -> Gtk.Box:
+        provider = get_provider(mode_id)
+        if provider is None:
+            return self._build_empty_mode_page(title)
+        return self._build_provider_mode_page(mode_id, title)
+
+    def _build_empty_mode_page(self, title: str) -> Gtk.Box:
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.set_margin_top(24)
+        page.set_margin_bottom(24)
+        page.set_margin_start(24)
+        page.set_margin_end(24)
+        heading = Gtk.Label(label=title, xalign=0)
+        heading.add_css_class("title-1")
+        page.append(heading)
+        placeholder = Gtk.Label(
+            label="Modo em preparação. Use a aba Pastas para analisar diretórios.",
+            xalign=0,
+            wrap=True,
+        )
+        placeholder.add_css_class("scan-muted")
+        page.append(placeholder)
+        return page
+
+    def _build_provider_mode_page(self, mode_id: str, title: str) -> Gtk.Box:
+        inspect_only_mode = mode_id == "trash"
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        page.set_margin_top(20)
+        page.set_margin_bottom(16)
+        page.set_margin_start(20)
+        page.set_margin_end(20)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        heading = Gtk.Label(label=title, xalign=0, hexpand=True)
+        heading.add_css_class("title-1")
+        header.append(heading)
+
+        space_label = Gtk.Label(label="", xalign=1, wrap=True)
+        space_label.add_css_class("scan-muted")
+        header.append(space_label)
+
+        rescan_button = Gtk.Button(label="Reescanear")
+        rescan_button.connect(
+            "clicked", lambda *_: self._reload_provider_mode(mode_id, compare_free_space=True)
+        )
+        header.append(rescan_button)
+        page.append(header)
+
+        subtitle_text = (
+            "Inventário somente para inspeção por tamanho e idade. Nenhum comando é gerado."
+            if inspect_only_mode
+            else "Selecione itens para revisar e gerar comandos para copiar no terminal."
+        )
+        subtitle = Gtk.Label(label=subtitle_text, xalign=0, wrap=True)
+        subtitle.add_css_class("scan-muted")
+        page.append(subtitle)
+
+        min_size_thresholds = (
+            ("Todos", 0),
+            ("≥ 10 MiB", 10 * 1024 * 1024),
+            ("≥ 100 MiB", 100 * 1024 * 1024),
+            ("≥ 500 MiB", 500 * 1024 * 1024),
+            ("≥ 1 GiB", 1024 * 1024 * 1024),
+        )
+        size_dropdown: Gtk.DropDown | None = None
+        downloads_toggle: Gtk.ToggleButton | None = None
+        if mode_id == "large_files":
+            filter_bar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            filter_label = Gtk.Label(label="Tamanho mínimo:", xalign=0)
+            filter_bar.append(filter_label)
+            size_dropdown = Gtk.DropDown.new_from_strings(
+                [label for label, _ in min_size_thresholds]
+            )
+            size_dropdown.set_selected(1)
+            size_dropdown.connect(
+                "notify::selected",
+                lambda *_: self._on_large_files_filter_changed(),
+            )
+            filter_bar.append(size_dropdown)
+
+            downloads_toggle = Gtk.ToggleButton(label="Apenas Downloads")
+            downloads_toggle.connect(
+                "toggled",
+                lambda *_: self._on_large_files_filter_changed(),
+            )
+            filter_bar.append(downloads_toggle)
+            page.append(filter_bar)
+
+        state_stack = Gtk.Stack(
+            transition_type=Gtk.StackTransitionType.CROSSFADE,
+            hexpand=True,
+            vexpand=True,
+        )
+        page.append(state_stack)
+
+        loading_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        loading_box.set_valign(Gtk.Align.CENTER)
+        loading_label = Gtk.Label(label="Carregando análise somente leitura…", xalign=0)
+        loading_label.add_css_class("scan-muted")
+        loading_box.append(loading_label)
+        state_stack.add_named(loading_box, "loading")
+
+        error_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        error_box.add_css_class("scan-card")
+        error_box.set_valign(Gtk.Align.START)
+        error_title = Gtk.Label(label="Não foi possível carregar este modo", xalign=0)
+        error_title.add_css_class("title-3")
+        error_box.append(error_title)
+        error_detail = Gtk.Label(label="", xalign=0, wrap=True, selectable=True)
+        error_detail.add_css_class("scan-muted")
+        error_box.append(error_detail)
+        error_actions = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        retry_button = Gtk.Button(label="Tentar de novo")
+        retry_button.connect("clicked", lambda *_: self._reload_provider_mode(mode_id))
+        error_actions.append(retry_button)
+        if mode_id == "large_files":
+            open_folders_btn = Gtk.Button(label="Ir para Pastas")
+            open_folders_btn.connect(
+                "clicked", lambda *_: self.mode_stack.set_visible_child_name("folders")
+            )
+            error_actions.append(open_folders_btn)
+            if downloads_toggle is not None:
+                inspect_dl_btn = Gtk.Button(label="Inspecionar Downloads")
+                inspect_dl_btn.connect(
+                    "clicked", lambda *_: downloads_toggle.set_active(True)
+                )
+                error_actions.append(inspect_dl_btn)
+        error_box.append(error_actions)
+        state_stack.add_named(error_box, "error")
+
+        empty_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        empty_box.set_valign(Gtk.Align.START)
+        empty_label = Gtk.Label(label="Nenhum item encontrado neste modo.", xalign=0)
+        empty_label.add_css_class("scan-muted")
+        empty_box.append(empty_label)
+        state_stack.add_named(empty_box, "empty")
+
+        content_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8, vexpand=True)
+        store = Gio.ListStore.new(ProviderRowEntry)
+        selection_model = Gtk.NoSelection.new(store)
+        column_view = Gtk.ColumnView.new(selection_model)
+        column_view.set_hexpand(True)
+        column_view.set_vexpand(True)
+
+        if not inspect_only_mode:
+            select_factory = Gtk.SignalListItemFactory()
+            select_factory.connect("setup", self._setup_provider_check_cell)
+            select_factory.connect("bind", self._bind_provider_check_cell, mode_id)
+            select_factory.connect("unbind", self._unbind_provider_check_cell)
+            select_col = Gtk.ColumnViewColumn.new("", select_factory)
+            select_col.set_fixed_width(48)
+            column_view.append_column(select_col)
+
+        item_factory = Gtk.SignalListItemFactory()
+        item_factory.connect("setup", self._setup_provider_item_cell)
+        item_factory.connect("bind", self._bind_provider_item_cell)
+        item_col = Gtk.ColumnViewColumn.new("Item", item_factory)
+        item_col.set_expand(True)
+        column_view.append_column(item_col)
+
+        risk_factory = Gtk.SignalListItemFactory()
+        risk_factory.connect("setup", self._setup_provider_text_cell)
+        risk_factory.connect("bind", self._bind_provider_risk_cell)
+        risk_col = Gtk.ColumnViewColumn.new("Risco", risk_factory)
+        risk_col.set_fixed_width(110)
+        column_view.append_column(risk_col)
+
+        size_factory = Gtk.SignalListItemFactory()
+        size_factory.connect("setup", self._setup_provider_size_cell)
+        size_factory.connect("bind", self._bind_provider_size_cell)
+        size_col = Gtk.ColumnViewColumn.new("Tamanho", size_factory)
+        size_col.set_fixed_width(170)
+        column_view.append_column(size_col)
+
+        scroller = Gtk.ScrolledWindow(hexpand=True, vexpand=True)
+        scroller.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        scroller.set_child(column_view)
+        content_box.append(scroller)
+
+        smaller_label = Gtk.Label(label="", xalign=0)
+        smaller_label.add_css_class("scan-muted")
+        smaller_label.set_visible(False)
+        content_box.append(smaller_label)
+        state_stack.add_named(content_box, "content")
+
+        footer = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        footer.add_css_class("results-footer")
+        if inspect_only_mode:
+            note = Gtk.Label(
+                label="Modo somente para inspeção: o Clearspace nunca apaga dados da lixeira.",
+                xalign=0,
+                hexpand=True,
+                wrap=True,
+            )
+            note.add_css_class("selection-note")
+            footer.append(note)
+            generate_button = None
+            selection_summary = note
+        else:
+            selection_summary = Gtk.Label(
+                label="0 itens selecionados", xalign=0, hexpand=True
+            )
+            footer.append(selection_summary)
+            generate_button = Gtk.Button(label="Gerar comandos…")
+            generate_button.add_css_class("suggested-action")
+            generate_button.set_sensitive(False)
+            generate_button.connect(
+                "clicked", lambda *_: self._review_provider_mode(mode_id)
+            )
+            footer.append(generate_button)
+        page.append(footer)
+
+        state_stack.set_visible_child_name("loading")
+        self._mode_states[mode_id] = {
+            "loaded": False,
+            "loading": False,
+            "generation": 0,
+            "rows_by_id": {},
+            "selected_ids": set(),
+            "last_free_bytes": None,
+            "state_stack": state_stack,
+            "store": store,
+            "error_detail": error_detail,
+            "smaller_label": smaller_label,
+            "selection_summary": selection_summary,
+            "generate_button": generate_button,
+            "rescan_button": rescan_button,
+            "space_label": space_label,
+            "inspect_only_mode": inspect_only_mode,
+            "size_dropdown": size_dropdown,
+            "size_thresholds": min_size_thresholds,
+            "downloads_toggle": downloads_toggle,
+        }
+        return page
+
+    def _on_large_files_filter_changed(self) -> None:
+        state = self._mode_states.get("large_files")
+        if state is None:
+            return
+        if self.mode_stack.get_visible_child_name() == "large_files":
+            self._reload_provider_mode("large_files")
+        else:
+            state["loaded"] = False
+
+    def _setup_provider_check_cell(self, _factory, list_item):
+        check = Gtk.CheckButton()
+        check.set_halign(Gtk.Align.CENTER)
+        check.set_valign(Gtk.Align.CENTER)
+        list_item.set_child(check)
+
+    def _bind_provider_check_cell(self, _factory, list_item, mode_id: str):
+        check = list_item.get_child()
+        entry: ProviderRowEntry = list_item.get_item()
+        row = entry.row
+        state = self._mode_states[mode_id]
+        selectable = is_row_selectable(row)
+        check.set_sensitive(selectable)
+        check.set_active(selectable and row.id in state["selected_ids"])
+        handler_id = check.connect(
+            "toggled", self._on_provider_row_toggled, mode_id, row.id
+        )
+        list_item._toggle_handler_id = handler_id
+
+    def _unbind_provider_check_cell(self, _factory, list_item):
+        check = list_item.get_child()
+        handler_id = getattr(list_item, "_toggle_handler_id", None)
+        if handler_id is not None and check is not None:
+            check.disconnect(handler_id)
+            list_item._toggle_handler_id = None
+
+    def _setup_provider_item_cell(self, _factory, list_item):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        box.set_margin_top(6)
+        box.set_margin_bottom(6)
+        title = Gtk.Label(xalign=0, wrap=True)
+        detail = Gtk.Label(xalign=0, wrap=True)
+        detail.add_css_class("scan-muted")
+        box.append(title)
+        box.append(detail)
+        list_item.set_child(box)
+
+    def _bind_provider_item_cell(self, _factory, list_item):
+        box = list_item.get_child()
+        title = box.get_first_child()
+        detail = title.get_next_sibling()
+        row = list_item.get_item().row
+        title.set_text(row.label)
+
+        notes: list[str] = []
+        if row.error is not None:
+            notes.append(f"Erro ({row.error.kind}): {row.error.message}")
+        elif row.action == "tool_command" and row.argv:
+            notes.append(f"Comando fixo: {shlex.join(row.argv)}")
+        elif row.action == "inspect_only":
+            notes.append("Somente inspeção")
+        notes.extend(row.warnings)
+        detail.set_text(" · ".join(notes))
+        detail.set_visible(bool(notes))
+
+    def _setup_provider_text_cell(self, _factory, list_item):
+        label = Gtk.Label(xalign=0)
+        list_item.set_child(label)
+
+    def _bind_provider_risk_cell(self, _factory, list_item):
+        label = list_item.get_child()
+        row = list_item.get_item().row
+        label.set_text(RISK_LABELS_PT_BR.get(row.risk, row.risk))
+
+    def _setup_provider_size_cell(self, _factory, list_item):
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        size_lbl = Gtk.Label(xalign=1)
+        size_lbl.add_css_class("size-value")
+        age_lbl = Gtk.Label(xalign=1)
+        age_lbl.add_css_class("scan-muted")
+        box.append(size_lbl)
+        box.append(age_lbl)
+        list_item.set_child(box)
+
+    def _bind_provider_size_cell(self, _factory, list_item):
+        box = list_item.get_child()
+        size_lbl = box.get_first_child()
+        age_lbl = size_lbl.get_next_sibling()
+        row = list_item.get_item().row
+        size_lbl.set_text("—" if row.size_bytes is None else format_bytes(row.size_bytes))
+        if row.mtime_ns is not None:
+            age_lbl.set_text(format_age_pt_br(row.mtime_ns))
+            age_lbl.set_visible(True)
+        else:
+            age_lbl.set_text("")
+            age_lbl.set_visible(False)
+
+    def _on_provider_row_toggled(self, check: Gtk.CheckButton, mode_id: str, row_id: str):
+        state = self._mode_states[mode_id]
+        row = state["rows_by_id"].get(row_id)
+        if row is None or not is_row_selectable(row):
+            check.set_active(False)
+            return
+        if check.get_active():
+            state["selected_ids"].add(row_id)
+        else:
+            state["selected_ids"].discard(row_id)
+        self._update_provider_selection_footer(mode_id)
+
+    def _update_provider_selection_footer(self, mode_id: str):
+        state = self._mode_states[mode_id]
+        if state["inspect_only_mode"]:
+            return
+        selected_rows = [
+            state["rows_by_id"][rid]
+            for rid in state["selected_ids"]
+            if rid in state["rows_by_id"]
+        ]
+        count = len(selected_rows)
+        total_bytes = sum(r.size_bytes or 0 for r in selected_rows)
+        if count == 0:
+            state["selection_summary"].set_text("0 itens selecionados")
+        else:
+            noun = "item selecionado" if count == 1 else "itens selecionados"
+            state["selection_summary"].set_text(
+                f"{count} {noun} (~{format_bytes(total_bytes)})"
+            )
+        if state["generate_button"] is not None:
+            state["generate_button"].set_sensitive(count > 0 and not state["loading"])
+
+    def _on_mode_changed(self, stack: Gtk.Stack, _param):
+        mode_id = stack.get_visible_child_name()
+        if not mode_id or mode_id not in self._mode_states:
+            return
+        state = self._mode_states[mode_id]
+        if not state["loaded"] and not state["loading"]:
+            self._reload_provider_mode(mode_id)
+
+    def _build_provider_context(self, mode_id: str | None = None) -> ProviderContext:
+        home_dir = Path(GLib.get_home_dir())
+        xdg = resolve_xdg_locations(
+            home_dir=home_dir,
+            cache_dir=GLib.get_user_cache_dir(),
+            downloads_dir=GLib.get_user_special_dir(GLib.UserDirectory.DIRECTORY_DOWNLOAD),
+            config_dir=GLib.get_user_config_dir(),
+        )
+        data_raw = GLib.get_user_data_dir()
+        state_raw = GLib.get_user_state_dir()
+        config_raw = GLib.get_user_config_dir()
+        xdg_cache = xdg["caches"] or (home_dir / ".cache")
+        xdg_data = Path(data_raw) if data_raw else (home_dir / ".local" / "share")
+        xdg_state = Path(state_raw) if state_raw else (home_dir / ".local" / "state")
+        xdg_config = Path(config_raw) if config_raw else (home_dir / ".config")
+        scan_db = getattr(self.scanner, "database_path", None) if self.scanner else None
+        scan_root = getattr(self.scanner, "root_path", None) if self.scanner else self.scan_root
+
+        min_bytes = 0
+        downloads_only = False
+        lf_state = self._mode_states.get("large_files")
+        if mode_id == "large_files" and lf_state is not None:
+            dropdown = lf_state.get("size_dropdown")
+            thresholds = lf_state.get("size_thresholds", ())
+            if dropdown is not None and thresholds:
+                selected_idx = int(dropdown.get_selected())
+                if 0 <= selected_idx < len(thresholds):
+                    min_bytes = thresholds[selected_idx][1]
+            dl_toggle = lf_state.get("downloads_toggle")
+            if dl_toggle is not None:
+                downloads_only = bool(dl_toggle.get_active())
+
+        return ProviderContext(
+            xdg_cache_home=xdg_cache,
+            xdg_data_home=xdg_data,
+            xdg_state_home=xdg_state,
+            xdg_config_home=xdg_config,
+            downloads_dir=xdg["downloads"],
+            scan_db_path=scan_db,
+            scan_root=scan_root,
+            os_release_path=Path("/etc/os-release"),
+            run_readonly_command=run_readonly_subprocess,
+            protected_paths=default_protected_paths(home_dir),
+            home_dir=home_dir,
+            environ=dict(os.environ),
+            large_files_min_bytes=min_bytes,
+            large_files_downloads_only=downloads_only,
+        )
+
+    def _current_free_bytes(self) -> int | None:
+        try:
+            vfs = os.statvfs(self.scan_root)
+            return int(vfs.f_bavail) * int(vfs.f_frsize)
+        except OSError:
+            return None
+
+    def _reload_provider_mode(self, mode_id: str, *, compare_free_space: bool = False):
+        provider = get_provider(mode_id)
+        if provider is None or mode_id not in self._mode_states:
+            return
+        state = self._mode_states[mode_id]
+        previous_free = state["last_free_bytes"] if compare_free_space else None
+        state["generation"] += 1
+        generation = state["generation"]
+        state["loading"] = True
+        state["rescan_button"].set_sensitive(False)
+        if state["generate_button"] is not None:
+            state["generate_button"].set_sensitive(False)
+        state["state_stack"].set_visible_child_name("loading")
+
+        context = self._build_provider_context(mode_id)
+        threading.Thread(
+            target=self._provider_mode_worker,
+            args=(mode_id, generation, provider, context, previous_free),
+            name=f"clearspace-provider-{mode_id}",
+            daemon=True,
+        ).start()
+
+    def _provider_mode_worker(
+        self,
+        mode_id: str,
+        generation: int,
+        provider,
+        context: ProviderContext,
+        previous_free: int | None,
+    ):
+        try:
+            result = provider.load(context)
+        except Exception as exc:
+            result = ProviderResult(
+                rows=(),
+                smaller_count=0,
+                smaller_bytes=0,
+                error=ClassifiedError(
+                    kind="unexpected",
+                    message=f"Falha inesperada ao analisar modo: {exc}",
+                ),
+            )
+        current_free = self._current_free_bytes()
+        GLib.idle_add(
+            self._apply_provider_mode_result,
+            mode_id,
+            generation,
+            result,
+            previous_free,
+            current_free,
+        )
+
+    def _apply_provider_mode_result(
+        self,
+        mode_id: str,
+        generation: int,
+        result: ProviderResult,
+        previous_free: int | None,
+        current_free: int | None,
+    ):
+        state = self._mode_states.get(mode_id)
+        if state is None or state["generation"] != generation:
+            return GLib.SOURCE_REMOVE
+
+        state["loading"] = False
+        state["loaded"] = True
+        state["rescan_button"].set_sensitive(True)
+        state["last_free_bytes"] = current_free
+
+        if current_free is not None:
+            if previous_free is not None:
+                delta = current_free - previous_free
+                if delta > 0:
+                    state["space_label"].set_text(
+                        f"Livre: {format_bytes(current_free)} (+{format_bytes(delta)} liberados)"
+                    )
+                else:
+                    state["space_label"].set_text(f"Livre: {format_bytes(current_free)}")
+            else:
+                state["space_label"].set_text(f"Livre: {format_bytes(current_free)}")
+
+        store: Gio.ListStore = state["store"]
+        store.remove_all()
+        state["rows_by_id"] = {row.id: row for row in result.rows}
+        state["selected_ids"] = {
+            rid
+            for rid in state["selected_ids"]
+            if rid in state["rows_by_id"] and is_row_selectable(state["rows_by_id"][rid])
+        }
+
+        if result.error is not None and not result.rows:
+            state["error_detail"].set_text(
+                f"[{result.error.kind}] {result.error.message}"
+            )
+            state["state_stack"].set_visible_child_name("error")
+            self._update_provider_selection_footer(mode_id)
+            return GLib.SOURCE_REMOVE
+
+        if not result.rows:
+            state["state_stack"].set_visible_child_name("empty")
+            self._update_provider_selection_footer(mode_id)
+            return GLib.SOURCE_REMOVE
+
+        for row in result.rows:
+            store.append(ProviderRowEntry(row))
+
+        summary_text = format_smaller_summary_pt_br(
+            result.smaller_count, result.smaller_bytes
+        )
+        state["smaller_label"].set_text(summary_text)
+        state["smaller_label"].set_visible(bool(summary_text))
+        state["state_stack"].set_visible_child_name("content")
+        self._update_provider_selection_footer(mode_id)
+        return GLib.SOURCE_REMOVE
+
+    def _review_provider_mode(self, mode_id: str):
+        state = self._mode_states.get(mode_id)
+        if state is None or state["loading"]:
+            return
+        selected_rows = tuple(
+            state["rows_by_id"][rid]
+            for rid in state["selected_ids"]
+            if rid in state["rows_by_id"]
+        )
+        if not selected_rows:
+            return
+        if state["generate_button"] is not None:
+            state["generate_button"].set_sensitive(False)
+        home_dir = Path(GLib.get_home_dir())
+        protected = default_protected_paths(home_dir)
+        threading.Thread(
+            target=self._provider_review_worker,
+            args=(mode_id, selected_rows, protected, home_dir),
+            name=f"clearspace-cmdgen-{mode_id}",
+            daemon=True,
+        ).start()
+
+    def _provider_review_worker(
+        self,
+        mode_id: str,
+        selected_rows: tuple[Row, ...],
+        protected,
+        home_dir: Path,
+    ):
+        gen_result = generate_commands(selected_rows, protected_paths=protected)
+        advisories = collect_review_advisories(selected_rows, home_dir=home_dir)
+        self.history.record_command_generated(gen_result)
+        GLib.idle_add(
+            self._show_provider_command_dialog, mode_id, gen_result, advisories
+        )
+
+    def _show_provider_command_dialog(
+        self,
+        mode_id: str,
+        gen_result: CommandGenerationResult,
+        advisories: tuple[str, ...],
+    ):
+        if mode_id == "folders":
+            self._set_workflow_busy(False)
+            self._refresh_selection_summary()
+        else:
+            self._update_provider_selection_footer(mode_id)
+        dialog = Gtk.Dialog(
+            title="Revisar comandos gerados",
+            transient_for=self.window,
+            modal=True,
+        )
+        dialog.add_button("Fechar", Gtk.ResponseType.CLOSE)
+        dialog.add_button("Reescanear", Gtk.ResponseType.APPLY)
+
+        content = dialog.get_content_area()
+        content.set_spacing(10)
+        content.set_margin_top(14)
+        content.set_margin_bottom(14)
+        content.set_margin_start(16)
+        content.set_margin_end(16)
+
+        warning_banner = Gtk.Label(
+            label="Revise antes de colar no terminal. O Clearspace nunca executa limpeza.",
+            xalign=0,
+            wrap=True,
+        )
+        warning_banner.add_css_class("scan-accent")
+        content.append(warning_banner)
+
+        total_est = sum(item.size_bytes or 0 for item in gen_result.generated)
+        summary_lbl = Gtk.Label(
+            label=(
+                f"Comandos gerados: {len(gen_result.generated)} · "
+                f"Estimativa selecionada: ~{format_bytes(total_est)}"
+            ),
+            xalign=0,
+            wrap=True,
+        )
+        content.append(summary_lbl)
+
+        all_notes = list(gen_result.warnings) + list(advisories)
+        if all_notes:
+            notes_text = "Avisos informativos:\n" + "\n".join(
+                f"• {note}" for note in dict.fromkeys(all_notes)
+            )
+            notes_lbl = Gtk.Label(
+                label=notes_text, xalign=0, wrap=True, selectable=True
+            )
+            notes_lbl.add_css_class("scan-muted")
+            content.append(notes_lbl)
+
+        if gen_result.blocked:
+            blocked_lines = [
+                f"• {item.label} [{item.reason.kind}]: {item.reason.message}"
+                for item in gen_result.blocked
+            ]
+            blocked_lbl = Gtk.Label(
+                label="Itens bloqueados (fora do script):\n" + "\n".join(blocked_lines),
+                xalign=0,
+                wrap=True,
+                selectable=True,
+            )
+            content.append(blocked_lbl)
+
+        if gen_result.generated:
+            item_lines = [
+                f"• {item.label}"
+                + (
+                    f" (~{format_bytes(item.size_bytes)})"
+                    if item.size_bytes is not None
+                    else ""
+                )
+                + (" [admin]" if item.needs_admin else "")
+                for item in gen_result.generated
+            ]
+            items_lbl = Gtk.Label(
+                label="Itens incluídos:\n" + "\n".join(item_lines),
+                xalign=0,
+                wrap=True,
+                selectable=True,
+            )
+            content.append(items_lbl)
+
+        def append_script_block(
+            section_title: str,
+            script_text: str,
+            button_label: str,
+            *,
+            min_height: int,
+            suggested: bool,
+        ) -> None:
+            title_lbl = Gtk.Label(label=section_title, xalign=0, wrap=True)
+            title_lbl.add_css_class("heading")
+            content.append(title_lbl)
+
+            text_view = Gtk.TextView(
+                editable=False,
+                cursor_visible=False,
+                monospace=True,
+                wrap_mode=Gtk.WrapMode.NONE,
+            )
+            display_text = (
+                script_text
+                if script_text
+                else "Nenhum comando gerado (todos os itens selecionados foram bloqueados)."
+            )
+            text_view.get_buffer().set_text(display_text)
+            script_scroller = Gtk.ScrolledWindow(
+                min_content_height=min_height,
+                min_content_width=720,
+                hexpand=True,
+                vexpand=True,
+            )
+            script_scroller.set_child(text_view)
+            content.append(script_scroller)
+
+            copy_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            copy_button = Gtk.Button(label=button_label)
+            if suggested:
+                copy_button.add_css_class("suggested-action")
+            copy_button.set_sensitive(bool(script_text))
+            copy_status = Gtk.Label(label="", xalign=0, hexpand=True, wrap=True)
+            copy_status.add_css_class("scan-muted")
+
+            def on_copy_clicked(_btn):
+                self.window.get_clipboard().set(script_text)
+                copy_status.set_text(
+                    "Script copiado. Revise cada linha antes de colar no terminal."
+                )
+
+            copy_button.connect("clicked", on_copy_clicked)
+            copy_row.append(copy_button)
+            copy_row.append(copy_status)
+            content.append(copy_row)
+
+        if gen_result.user_script or not gen_result.admin_script:
+            append_script_block(
+                "Comandos para copiar (revise antes de colar no terminal):",
+                gen_result.user_script,
+                "Copiar",
+                min_height=200 if gen_result.admin_script else 260,
+                suggested=True,
+            )
+
+        if gen_result.admin_script:
+            append_script_block(
+                "Requer administrador (revise com atenção):",
+                gen_result.admin_script,
+                "Copiar comandos de administrador",
+                min_height=160,
+                suggested=not gen_result.user_script,
+            )
+
+        def on_dialog_response(dlg, response_id):
+            dlg.destroy()
+            if response_id == Gtk.ResponseType.APPLY:
+                if mode_id == "folders":
+                    self._folders_compare_prev_free = self._folders_last_free_bytes
+                    self.scan(self.scan_root, self.scan_options)
+                else:
+                    self._reload_provider_mode(mode_id, compare_free_space=True)
+
+        dialog.set_default_response(Gtk.ResponseType.CLOSE)
+        dialog.connect("response", on_dialog_response)
+        dialog.present()
+        return GLib.SOURCE_REMOVE
 
     def _install_theme(self):
         css = """
@@ -264,7 +1072,34 @@ class Clearspace(Gtk.Application):
         progressbar trough { min-height: 14px; border-radius: 8px; background: #34383a; }
         progressbar progress { min-height: 14px; border-radius: 8px; background: #5aa9ff; }
         button { min-height: 40px; }
-        checkbutton { min-width: 40px; min-height: 40px; }
+        checkbutton { min-width: 36px; min-height: 36px; }
+        checkbutton > check {
+            min-width: 18px;
+            min-height: 18px;
+            border-radius: 4px;
+            background-image: none;
+            background-color: #232627;
+            border: 2px solid #7d868a;
+            color: #ffffff;
+        }
+        checkbutton:hover > check {
+            border-color: #5aa9ff;
+            background-color: #2b3033;
+        }
+        checkbutton > check:checked,
+        checkbutton > check:indeterminate {
+            background-image: none;
+            background-color: #3584e4;
+            border-color: #5aa9ff;
+            color: #ffffff;
+        }
+        checkbutton:disabled > check,
+        checkbutton > check:disabled {
+            opacity: 0.32;
+            background-image: none;
+            background-color: #161819;
+            border-color: #3a3f42;
+        }
         entry { min-height: 40px; }
         .scan-current-path { font-family: monospace; color: #a9b0b3; }
         .quick-pick, .ready-card, .folder-browser { background: #232627;
@@ -1096,7 +1931,7 @@ class Clearspace(Gtk.Application):
                 pause_event=pause_event,
             )
             evaluation = self.rule_engine.evaluate(root)
-            inspection_roots = inspection_only_paths(scan_root)
+            inspection_roots = inspection_only_paths(self._home_dir)
             usage = shutil.disk_usage(scan_root)
             consumers = []
             for node in scanner.load_children_page(root, offset=0, limit=4, include_more=False):
@@ -1397,11 +2232,14 @@ class Clearspace(Gtk.Application):
         if old_scanner is not None and old_scanner is not scanner:
             old_scanner.close()
         self.scanner = scanner
+        if "large_files" in self._mode_states:
+            self._mode_states["large_files"]["loaded"] = False
         self.scan_report = report
         self.scan_report_button.set_sensitive(True)
         self.root_node = root
         ui_build_started = time.monotonic()
         self.inspection_only_roots = inspection_roots
+        self.protected_paths = default_protected_paths(self._home_dir)
         self.selection = SelectionModel([root])
         self._selected_evaluations.clear()
         self.entries.clear()
@@ -1422,13 +2260,9 @@ class Clearspace(Gtk.Application):
         self.tree_selection.connect("notify::selected-item", self._selected_item_changed)
         self.tree_view = Gtk.ColumnView.new(self.tree_selection)
         self.tree_view.connect("map", self._tree_mapped)
-        # GTK's RTL column resize math reverses horizontal drag direction.
-        # Append in reverse so the visible left-to-right order stays unchanged.
-        self.tree_view.set_direction(Gtk.TextDirection.RTL)
         self.tree_view.set_show_row_separators(True)
         self.tree_view.set_show_column_separators(False)
-        self.tree_view.set_tab_behavior(Gtk.ListTabBehavior.CELL)
-        self._set_accessible_label(self.tree_view, "Disk usage file tree")
+        self._set_accessible_label(self.tree_view, "Árvore de uso de disco")
         key_controller = Gtk.EventControllerKey()
         key_controller.connect("key-pressed", self._tree_key_pressed)
         self.tree_view.add_controller(key_controller)
@@ -1441,7 +2275,7 @@ class Clearspace(Gtk.Application):
             self._size_column(),
             self._risk_column(),
         ))
-        for column in reversed(columns):
+        for column in columns:
             self.tree_view.append_column(column)
         self.tree_scroll.set_child(self.tree_view)
         root_row = tree_model.get_row(0)
@@ -1449,11 +2283,20 @@ class Clearspace(Gtk.Application):
             root_row.set_expanded(True)
         report["gtk_model_build_seconds"] = round(time.monotonic() - ui_build_started, 3)
         report["python_peak_rss_kib"] = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        current_free = self._current_free_bytes()
+        prev_free = self._folders_compare_prev_free
+        self._folders_compare_prev_free = None
+        self._folders_last_free_bytes = current_free
+        freed_suffix = ""
+        if current_free is not None and prev_free is not None:
+            delta = current_free - prev_free
+            if delta > 0:
+                freed_suffix = f" (+{format_bytes(delta)} liberados)"
         if usage:
             elapsed_ms = int(float(report.get("elapsed_seconds", 0)) * 1000)
             self.disk_label.set_text(
-                f"{format_size_gib(usage.free)} free of {format_size_gib(usage.total)} · "
-                f"scanned {report.get('directories', 0):,} folders in "
+                f"{format_size_gib(usage.free)} livres de {format_size_gib(usage.total)}{freed_suffix} · "
+                f"{report.get('directories', 0):,} pastas lidas em "
                 f"{format_elapsed(elapsed_ms)}"
             )
         self.scan_button.set_sensitive(True)
@@ -1512,15 +2355,24 @@ class Clearspace(Gtk.Application):
         loading: bool = False,
         parent_entry: TreeEntry | None = None,
     ) -> TreeEntry:
-        home = Path(GLib.get_home_dir()).resolve(strict=False)
-        if node.path.resolve(strict=False) == home or any(
-            node.path == protected
-            or node.path.is_relative_to(protected)
-            or protected.is_relative_to(node.path)
-            for protected in self.inspection_only_roots
-        ):
-            node.selectable = False
+        block_reason: str | None = None
+        if not loading:
+            active_scan_root = (
+                self.scanner.root_path if self.scanner is not None else self.scan_root
+            )
+            eligibility = evaluate_tree_node_eligibility(
+                node,
+                scan_root=active_scan_root,
+                home_dir=self._home_dir,
+                protected_paths=self.protected_paths,
+                inspection_roots=self.inspection_only_roots,
+                evaluation=evaluation,
+            )
+            if not eligibility.selectable:
+                node.selectable = False
+                block_reason = eligibility.reason
         entry = TreeEntry(node, evaluation, loading=loading, parent_entry=parent_entry)
+        entry.block_reason = block_reason
         entry.scanner = self.scanner
         self._live_entry_count += 1
         if node.selectable and not node.aggregate_count and not node.is_more_row:
@@ -1844,13 +2696,14 @@ class Clearspace(Gtk.Application):
         factory.connect("bind", self._checkbox_bind)
         factory.connect("unbind", self._checkbox_unbind)
         column = Gtk.ColumnViewColumn.new("Selecionar", factory)
-        column.set_fixed_width(112)
+        column.set_fixed_width(72)
         column.set_resizable(True)
         return column
 
     def _checkbox_setup(self, _factory, list_item):
         checkbox = Gtk.CheckButton()
         checkbox.set_halign(Gtk.Align.CENTER)
+        checkbox.set_valign(Gtk.Align.CENTER)
         checkbox.connect("toggled", self._checkbox_toggled)
         list_item.set_child(checkbox)
 
@@ -1861,10 +2714,16 @@ class Clearspace(Gtk.Application):
         tree_row = list_item.get_item()
         entry = tree_row.get_item()
         checkbox._clearspace_entry = entry
-        self._set_accessible_label(checkbox, f"Select {entry.node.name}")
-        checkbox.set_sensitive(entry.node.selectable and not entry.loading)
-        if entry.node.selectable:
+        self._set_accessible_label(checkbox, f"Selecionar {entry.node.name}")
+        selectable = bool(entry.node.selectable and not entry.loading)
+        checkbox.set_sensitive(selectable)
+        if selectable:
+            checkbox.set_tooltip_text("Marcar para gerar comando gio trash")
             self.check_buttons.setdefault(entry.node.path, []).append(checkbox)
+        else:
+            checkbox.set_tooltip_text(
+                entry.block_reason or "Seleção indisponível para este item."
+            )
         self._set_checkbox_state(checkbox, entry)
 
     def _checkbox_unbind(self, _factory, list_item):
@@ -1883,13 +2742,13 @@ class Clearspace(Gtk.Application):
                 self.check_buttons.pop(entry.node.path, None)
 
     def _set_checkbox_state(self, checkbox, entry):
-        if not self.selection or not entry.node.selectable:
-            checkbox.set_active(False)
-            checkbox.set_inconsistent(False)
-            return
-        state = self.selection.state(entry.node)
         self._syncing_checks += 1
         try:
+            if not self.selection or not entry.node.selectable:
+                checkbox.set_active(False)
+                checkbox.set_inconsistent(False)
+                return
+            state = self.selection.state(entry.node)
             checkbox.set_active(state is SelectionState.CHECKED)
             checkbox.set_inconsistent(state is SelectionState.PARTIAL)
         finally:
@@ -1901,7 +2760,16 @@ class Clearspace(Gtk.Application):
         entry = getattr(checkbox, "_clearspace_entry", None)
         if not entry or not entry.node.selectable:
             return
-        self.selection.set_checked(entry.node, checkbox.get_active())
+        checked = checkbox.get_active()
+        self.selection.set_checked(entry.node, checked)
+        if checked:
+            ev = entry.evaluation or self.rule_engine.evaluate(entry.node)
+            entry.evaluation = ev
+            self._selected_evaluations[entry.node.path] = ev
+        active_paths = set(self.selection.selected_paths)
+        for recorded_path in tuple(self._selected_evaluations):
+            if recorded_path not in active_paths:
+                self._selected_evaluations.pop(recorded_path, None)
         self._refresh_all_checkboxes()
         self._refresh_selection_summary()
 
@@ -2119,9 +2987,16 @@ class Clearspace(Gtk.Application):
             if not entry.node.selectable:
                 return True
             current = self.selection.state(entry.node)
-            self.selection.set_checked(
-                entry.node, current is not SelectionState.CHECKED
-            )
+            new_checked = current is not SelectionState.CHECKED
+            self.selection.set_checked(entry.node, new_checked)
+            if new_checked:
+                ev = entry.evaluation or self.rule_engine.evaluate(entry.node)
+                entry.evaluation = ev
+                self._selected_evaluations[entry.node.path] = ev
+            active_paths = set(self.selection.selected_paths)
+            for recorded_path in tuple(self._selected_evaluations):
+                if recorded_path not in active_paths:
+                    self._selected_evaluations.pop(recorded_path, None)
             self._refresh_all_checkboxes()
             self._refresh_selection_summary()
             return True
@@ -2137,13 +3012,13 @@ class Clearspace(Gtk.Application):
             if tree_row.get_expanded():
                 tree_row.set_expanded(False)
                 return True
-        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and entry.node.is_more_row:
-            self._start_page_load(entry.parent_entry, entry.node.more_offset)
-            return True
             parent_row = tree_row.get_parent()
             if parent_row is not None:
                 self.tree_selection.set_selected(parent_row.get_position())
                 return True
+        if keyval in (Gdk.KEY_Return, Gdk.KEY_KP_Enter) and entry.node.is_more_row:
+            self._start_page_load(entry.parent_entry, entry.node.more_offset)
+            return True
         return False
 
     def _show_details(self, entry: TreeEntry | None):
@@ -2152,11 +3027,11 @@ class Clearspace(Gtk.Application):
             entry.node.name
             if entry and not entry.loading and not entry.node.aggregate_count
             and not entry.node.is_more_row
-            else "the selected item"
+            else "o item selecionado"
         )
-        self.explain_risk_chip.set_label(f"Explain the risk of {selected_name}")
+        self.explain_risk_chip.set_label(f"Explicar o risco de {selected_name}")
         if not entry or entry.loading:
-            self.detail_title.set_text("Select an item")
+            self.detail_title.set_text("Selecione um item")
             self.detail_size.set_text("")
             self.detail_path.set_text("")
             self.detail_warning.set_text("")
@@ -2171,7 +3046,8 @@ class Clearspace(Gtk.Application):
         if entry.node.error:
             size_text += f"\n{entry.node.error}"
         if not entry.node.selectable and not entry.node.error:
-            size_text += "\nAlvo somente para inspeção; seleção bloqueada."
+            reason = entry.block_reason or "Alvo somente para inspeção; seleção bloqueada."
+            size_text += f"\n{reason}"
         self.detail_size.set_text(size_text)
         self.detail_path.set_text(
             f"Agrupa {entry.node.aggregate_count} itens menores nesta pasta."
@@ -2233,25 +3109,30 @@ class Clearspace(Gtk.Application):
             return
         paths = self.selection.selected_paths
         total = self.selection.estimated_size_bytes
+        if not paths:
+            self.selection_label.set_text("0 itens selecionados")
+            self.review_button.set_sensitive(False)
+            return
         max_risk = max(
             (
                 self._selected_evaluations[path].risk
                 for path in paths if path in self._selected_evaluations
             ),
             key=self._risk_rank,
-            default=None,
+            default=Risk.MODERATE,
         )
         risk_text = {
-            Risk.LOW: "Low",
-            Risk.MODERATE: "Moderate",
-            Risk.USER_DATA: "Your data",
-            Risk.CRITICAL: "Critical",
-        }.get(max_risk, "None")
+            Risk.LOW: "Baixo",
+            Risk.MODERATE: "Médio",
+            Risk.USER_DATA: "Alto",
+            Risk.CRITICAL: "Crítico",
+        }.get(max_risk, "Médio")
+        noun = "item selecionado" if len(paths) == 1 else "itens selecionados"
         self.selection_label.set_text(
-            f"{len(paths)} items selected · {format_size_gib(total)} · "
-            f"highest risk: {risk_text}"
+            f"{len(paths)} {noun} · {format_size_gib(total)} · "
+            f"maior risco: {risk_text}"
         )
-        self.review_button.set_sensitive(bool(paths) and not self._workflow_busy)
+        self.review_button.set_sensitive(not self._workflow_busy)
 
     @staticmethod
     def _risk_rank(risk: Risk) -> int:
@@ -2261,289 +3142,61 @@ class Clearspace(Gtk.Application):
         if not self.selection or not self.selection.selected_paths:
             return
         self._set_workflow_busy(True)
-        self.disk_label.set_text("Validando caminhos e calculando revisão…")
+        self.disk_label.set_text("Validando seleção e gerando comandos…")
         paths = tuple(self.selection.selected_paths)
-        risks = {}
-        warnings = {}
+        sizes_by_path: dict[Path, int] = {}
+        evaluations_by_path: dict[Path, RuleEvaluation] = {}
         for path in paths:
             entry = self.entries.get(path)
-            evaluation = entry.evaluation if entry else None
-            risks[path] = evaluation.risk if evaluation else Risk.MODERATE
-            warnings[path] = evaluation.warnings if evaluation else ()
+            if entry is not None:
+                sizes_by_path[path] = entry.node.size_bytes
+                if entry.evaluation is not None:
+                    evaluations_by_path[path] = entry.evaluation
+            elif path in self._selected_evaluations:
+                evaluations_by_path[path] = self._selected_evaluations[path]
+        scan_root = self.scanner.root_path if self.scanner else self.scan_root
+        protected = self.protected_paths
+        inspection_roots = self.inspection_only_roots
+        home_dir = self._home_dir
         threading.Thread(
-            target=self._review_worker,
-            args=(paths, risks, warnings),
-            daemon=True,
-        ).start()
-
-    def _review_worker(self, paths, risks, warnings):
-        try:
-            scan_root = self.scanner.root_path if self.scanner else self.scan_root
-            active = discover_active_paths(scan_root) + self.inspection_only_roots
-            review = build_review(
+            target=self._folders_review_worker,
+            args=(
                 paths,
-                allowed_root=scan_root,
-                risks=risks,
-                warnings=warnings,
-                active_paths=active,
-                trash_support=gio_trash_supported,
-            )
-            error = None
-        except ActiveApplicationError as exc:
-            review = None
-            error = exc
-        except Exception as exc:
-            review = None
-            error = str(exc)
-        GLib.idle_add(self._show_review, review, error)
-
-    def _show_review(self, review: CleanupReview | None, error: str | Exception | None):
-        self._refresh_selection_summary()
-        if error or review is None:
-            self._set_workflow_busy(False)
-            if isinstance(error, ActiveApplicationError):
-                dialog = Gtk.AlertDialog()
-                dialog.set_message("Aplicação em uso")
-                dialog.set_detail(str(error))
-                dialog.set_buttons(["Fechar e tentar novamente", "Cancelar"])
-                dialog.set_cancel_button(1)
-                dialog.set_default_button(1)
-                dialog.choose(self.window, None, self._active_application_review_response, None)
-                return GLib.SOURCE_REMOVE
-            self._show_message("Revisão bloqueada", error or "Não foi possível revisar a seleção.")
-            return GLib.SOURCE_REMOVE
-        ordered_items = tuple(sorted(
-            review.items,
-            key=lambda item: (
-                -self._risk_rank(item.risk), -item.size_bytes, str(item.path)
+                scan_root,
+                sizes_by_path,
+                evaluations_by_path,
+                protected,
+                inspection_roots,
+                home_dir,
             ),
-        ))
-        review = replace(review, items=ordered_items)
-        self._review = review
-        self._execution_results = []
-        lines = []
-        for item in review.items:
-            blocked = " · BLOQUEADO: risco crítico" if item.risk is Risk.CRITICAL else ""
-            lines.append(
-                f"• {item.path}\n  {format_bytes(item.size_bytes)} · risco {item.risk.value}{blocked}"
-            )
-            lines.extend(f"  Aviso: {warning}" for warning in item.warnings)
-            if item.trash_supported is False:
-                command = "rm -r -- " + shlex.quote(str(item.path))
-                lines.append(f"  Comando para uso por conta própria: {command}")
-        detail = (
-            "\n".join(lines)
-            + f"\n\nTotal estimado: {format_bytes(review.total_size_bytes)}"
-            + f"\nRisco máximo: {review.maximum_risk.value}"
-            + f"\n\n{review.notice}"
-        )
-        dialog = Gtk.Dialog(title="Revisar lote de limpeza", transient_for=self.window, modal=True)
-        dialog.add_button("Cancelar", Gtk.ResponseType.CANCEL)
-        trash_button = dialog.add_button(
-            "Mover itens permitidos para a lixeira", Gtk.ResponseType.APPLY
-        )
-        permanent_button = dialog.add_button(
-            "Excluir itens permitidos permanentemente", Gtk.ResponseType.ACCEPT
-        )
-        content = dialog.get_content_area()
-        content.append(Gtk.Label(
-            label="Confira todos os itens. A ordem é risco decrescente e depois tamanho.",
-            xalign=0,
-            wrap=True,
-        ))
-        listing = Gtk.Label(label=detail, xalign=0, yalign=0, wrap=True, selectable=True)
-        listing.set_margin_top(8)
-        listing.set_margin_bottom(8)
-        listing.set_margin_start(8)
-        listing.set_margin_end(8)
-        scroller = Gtk.ScrolledWindow(min_content_height=360, min_content_width=720)
-        scroller.set_child(listing)
-        content.append(scroller)
-        has_user_data = any(item.risk is Risk.USER_DATA for item in review.items)
-        if has_user_data:
-            acknowledge = Gtk.CheckButton(
-                label="Entendo que itens marcados como dados pessoais podem conter conteúdo importante"
-            )
-            acknowledge.set_active(False)
-            trash_button.set_sensitive(False)
-            permanent_button.set_sensitive(False)
-
-            def update_batch_buttons(check):
-                enabled = check.get_active()
-                trash_button.set_sensitive(enabled)
-                permanent_button.set_sensitive(enabled)
-
-            acknowledge.connect("toggled", update_batch_buttons)
-            content.append(acknowledge)
-        dialog.set_default_response(Gtk.ResponseType.CANCEL)
-        dialog.connect("response", self._review_response, review)
-        dialog.present()
-        return GLib.SOURCE_REMOVE
-
-    def _active_application_review_response(self, dialog, result, _data):
-        try:
-            choice = dialog.choose_finish(result)
-        except GLib.Error:
-            return
-        if choice == 0:
-            self.review_selection(None)
-
-    def _review_response(self, dialog, result, review):
-        dialog.destroy()
-        if result not in (Gtk.ResponseType.APPLY, Gtk.ResponseType.ACCEPT):
-            self._cancel_review_plan()
-            return
-        self._review = review
-        self._review_action = (
-            FileAction.TRASH
-            if result == Gtk.ResponseType.APPLY
-            else FileAction.PERMANENT
-        )
-        executable_items = tuple(
-            item for item in review.items if item.risk is not Risk.CRITICAL
-        )
-        if not executable_items:
-            self._cancel_review_plan()
-            self._show_message(
-                "Ação bloqueada", "Todos os itens selecionados têm risco crítico."
-            )
-            return
-
-        user_data_confirmed = any(
-            item.risk is Risk.USER_DATA for item in review.items
-        )
-        self._set_workflow_busy(True)
-        self._execution_results = []
-        self.disk_label.set_text("Executando lote; cada item será validado e registrado…")
-        threading.Thread(
-            target=self._execute_review_batch,
-            args=(review, self._review_action, user_data_confirmed),
-            name="clearspace-cleanup-batch",
+            name="clearspace-cmdgen-folders",
             daemon=True,
         ).start()
 
-    def _execute_review_batch(self, review, action, user_data_confirmed):
-        scan_root = review.allowed_root
-        executor = ItemExecutor(
-            self.history,
-            active_paths=lambda: discover_active_paths(scan_root)
-            + self.inspection_only_roots,
+    def _folders_review_worker(
+        self,
+        paths: tuple[Path, ...],
+        scan_root: Path,
+        sizes_by_path: dict[Path, int],
+        evaluations_by_path: dict[Path, RuleEvaluation],
+        protected,
+        inspection_roots: tuple[Path, ...],
+        home_dir: Path,
+    ):
+        rows = build_folder_selection_rows(
+            paths,
+            scan_root=scan_root,
+            sizes_by_path=sizes_by_path,
+            evaluations_by_path=evaluations_by_path,
+            protected_paths=protected,
+            inspection_roots=inspection_roots,
         )
-        results = []
-        eligible = tuple(item for item in review.items if item.risk is not Risk.CRITICAL)
-        for index, item in enumerate(eligible, start=1):
-            GLib.idle_add(
-                self._batch_item_progress,
-                index,
-                len(eligible),
-                item.path,
-            )
-            results.append(executor.execute_one(
-                review,
-                item.path,
-                action,
-                user_data_confirmed=user_data_confirmed,
-                permanent_confirmed=action is FileAction.PERMANENT,
-            ))
-        for item in review.items:
-            if item.risk is Risk.CRITICAL:
-                results.append(executor.execute_one(
-                    review,
-                    item.path,
-                    action,
-                    user_data_confirmed=False,
-                    permanent_confirmed=False,
-                ))
-        ordered_results = tuple(sorted(
-            results,
-            key=lambda result: (
-                -self._risk_rank(next(
-                    item.risk for item in review.items if item.path == result.path
-                )),
-                -next(item.size_bytes for item in review.items if item.path == result.path),
-                str(result.path),
-            ),
-        ))
-        GLib.idle_add(self._batch_execution_finished, ordered_results)
-
-    def _batch_item_progress(self, index, total, path):
-        self.disk_label.set_text(f"Executando item {index} de {total}: {path.name}…")
-        return GLib.SOURCE_REMOVE
-
-    def _batch_execution_finished(self, results):
-        self._execution_results = list(results)
-        self._show_execution_summary()
-        return GLib.SOURCE_REMOVE
-
-    def _show_execution_summary(self):
-        results = tuple(self._execution_results)
-        succeeded = sum(result.success for result in results)
-        failed = len(results) - succeeded
-        verb = "movidos" if self._review_action is FileAction.TRASH else "excluídos"
-        dialog = Gtk.Dialog(title="Resumo da execução", transient_for=self.window, modal=True)
-        dialog.add_button("Fechar", Gtk.ResponseType.CLOSE)
-        rescan_button = dialog.add_button("Reanalisar agora", Gtk.ResponseType.APPLY)
-        rescan_button.add_css_class("suggested-action")
-        content = dialog.get_content_area()
-        content.append(Gtk.Label(label=f"{succeeded} {verb}, {failed} falharam", xalign=0))
-        if self._review_action is FileAction.TRASH:
-            content.append(Gtk.Label(
-                label="O espaço só é liberado ao esvaziar a lixeira.", xalign=0
-            ))
-        for result in results:
-            if result.success:
-                continue
-            record = result.record
-            kind = record.get("failure_kind")
-            messages = {
-                "app_protected": "Bloqueado pelas proteções do Clearspace",
-                "application_in_use": "Aplicação em uso; feche e tente novamente",
-                "outside_scan_root": "Caminho fora da raiz do scan",
-                "filesystem_permission": "Sem permissão do sistema de arquivos",
-                "trash_unavailable": "Lixeira indisponível neste filesystem",
-                "missing": "O item não existe mais",
-            }
-            row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-            detail = Gtk.Label(
-                label=f"{messages.get(kind, 'Falha na operação')}: {result.path}\n"
-                f"{record.get('failure_message') or record.get('failure_details') or ''}",
-                xalign=0,
-                wrap=True,
-                hexpand=True,
-            )
-            row.append(detail)
-            copy_button = Gtk.Button(label="Copiar caminho")
-            copy_button.connect("clicked", self._copy_failed_path, str(result.path))
-            row.append(copy_button)
-            content.append(row)
-        dialog.connect("response", self._execution_summary_closed)
-        dialog.present()
-
-    def _copy_failed_path(self, _button, path):
-        self.window.get_display().get_clipboard().set(path)
-
-    def _execution_summary_closed(self, dialog, response):
-        dialog.destroy()
-        review = self._review
-        self._review = None
-        self._review_action = None
-        self._execution_results = []
-        self._set_workflow_busy(False)
-        if response == Gtk.ResponseType.APPLY and review is not None:
-            self.scan(review.allowed_root)
-            return
-        self.disk_label.set_text(
-            "Resultados desatualizados após a limpeza. Reanalise antes de selecionar itens."
+        gen_result = generate_commands(rows, protected_paths=protected)
+        advisories = collect_review_advisories(rows, home_dir=home_dir)
+        self.history.record_command_generated(gen_result)
+        GLib.idle_add(
+            self._show_provider_command_dialog, "folders", gen_result, advisories
         )
-        if hasattr(self, "tree_view"):
-            self.tree_view.set_sensitive(False)
-        self.review_button.set_sensitive(False)
-
-    @staticmethod
-    def _free_space_text(record):
-        if "free_bytes" not in record:
-            return record.get("error", "indisponível")
-        return format_bytes(record["free_bytes"])
 
     def _show_message(self, title, message):
         dialog = Gtk.AlertDialog()
@@ -2565,12 +3218,6 @@ class Clearspace(Gtk.Application):
             self.review_button.set_sensitive(
                 bool(self.selection and self.selection.selected_paths) and not busy
             )
-
-    def _cancel_review_plan(self):
-        self._review = None
-        self._review_action = None
-        self._set_workflow_busy(False)
-        self._refresh_selection_summary()
 
 
 if __name__ == "__main__":
